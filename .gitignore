@@ -1,0 +1,6 @@
+solana_staking_analyzer/wallet_config.json
+*.pyc
+_*.*
+.venv
+*.csv
+*.json

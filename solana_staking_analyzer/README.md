@@ -28,10 +28,10 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Edit `config.json` before running the script.
+Edit `config.cfg` and `wallet_config.json` before running the script.
 
-- `wallet_address`: Your Solana wallet public key in base58 form.
-- `rpc_endpoint`: RPC URL (defaults to `https://api.mainnet-beta.solana.com`).
+- `wallet_config.json` → `wallet_address`: Your Solana wallet public key in base58 form.
+- `config.cfg` → `rpc_endpoint`: RPC URL (defaults to `https://api.mainnet-beta.solana.com`).
 - `concurrency_limit`: Maximum number of concurrent RPC calls (tune based on provider limits).
 - `output_format`: Any combination of `console`, `json`, `csv`.
 - `json_output_file`, `csv_output_file`: Filenames for saved reports relative to the project directory.

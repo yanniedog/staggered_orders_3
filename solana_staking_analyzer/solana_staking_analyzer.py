@@ -12,6 +12,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
+import socket
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,13 +22,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import pandas as pd
-from solana.publickey import PublicKey
+from solders.pubkey import Pubkey
 
 
 LAMPORTS_PER_SOL = 1_000_000_000
 STAKE_PROGRAM_ID = "Stake11111111111111111111111111111111111111"
-MAX_RPC_RETRIES = 5
-RETRY_BACKOFF_SECONDS = 0.5
+MAX_RPC_RETRIES = 8
+MAX_ENDPOINT_FAILURES = 3
+RETRY_BACKOFF_SECONDS = 1.0
+MAX_RETRY_BACKOFF_SECONDS = 12.0
+RETRY_BACKOFF_JITTER = 0.25
+RATE_LIMIT_STATUS_CODES = {429}
+CONFIG_FILENAME = "config.cfg"
+ENDPOINT_ROTATION_STATUS_CODES = {429, 503}
 
 
 class ConfigurationError(RuntimeError):
@@ -47,6 +56,26 @@ def safe_int(value: Any) -> Optional[int]:
         return int(value)
     except (ValueError, TypeError):
         return None
+
+
+def summarize_payload(payload: Dict[str, Any], limit: int = 800) -> str:
+    try:
+        serialized = json.dumps(payload, default=str)
+    except TypeError:
+        serialized = str(payload)
+    if len(serialized) > limit:
+        return serialized[: limit - 3] + "..."
+    return serialized
+
+
+def summarize_result(result: Any, limit: int = 400) -> str:
+    try:
+        serialized = json.dumps(result, default=str)
+    except TypeError:
+        serialized = str(result)
+    if len(serialized) > limit:
+        return serialized[: limit - 3] + "..."
+    return serialized
 
 
 def normalize_epoch(value: Any) -> Optional[int]:
@@ -97,6 +126,8 @@ class StakeAccount:
     validator_commission: Optional[int] = None
     validator_uptime_ratio: Optional[float] = None
     validator_delinquent: Optional[bool] = None
+    delegation_history: List["DelegationEvent"] = field(default_factory=list)
+    historical_validators: List[str] = field(default_factory=list)
 
     @property
     def delegated_sol(self) -> float:
@@ -108,13 +139,18 @@ class StakeAccount:
 
 
 class SolanaRPCClient:
-    def __init__(self, endpoint: str, concurrency_limit: int, timeout: float = 35.0) -> None:
-        self.endpoint = endpoint
+    def __init__(self, endpoints: List[str], concurrency_limit: int, timeout: float = 35.0) -> None:
+        if not endpoints:
+            raise ConfigurationError("At least one RPC endpoint must be provided")
+        self.endpoints = endpoints
+        self._current_index = 0
         self._timeout = timeout
         self._client: Optional[httpx.AsyncClient] = None
         self._semaphore = asyncio.Semaphore(concurrency_limit)
         self._request_id = 0
         self.logger = logging.getLogger(self.__class__.__name__)
+        self._unhealthy: Dict[str, float] = {}
+        self._endpoint_failures: Dict[str, int] = {}
 
     async def __aenter__(self) -> "SolanaRPCClient":
         self._client = httpx.AsyncClient(timeout=self._timeout)
@@ -135,40 +171,163 @@ class SolanaRPCClient:
             "method": method,
             "params": params or [],
         }
+        payload_summary = summarize_payload(payload)
 
         attempt = 0
         while True:
             attempt += 1
             async with self._semaphore:
+                delay: Optional[float] = None
                 try:
-                    response = await self._client.post(self.endpoint, json=payload)
+                    endpoint = self.endpoints[self._current_index]
+                    self.logger.info(
+                        "RPC Request -> method=%s attempt=%d endpoint=%s payload=%s",
+                        method,
+                        attempt,
+                        endpoint,
+                        payload_summary,
+                    )
+                    response = await self._client.post(endpoint, json=payload)
                     response.raise_for_status()
                     data = response.json()
+                    self.logger.info(
+                        "RPC Response <- method=%s attempt=%d status=%s endpoint=%s body=%s",
+                        method,
+                        attempt,
+                        response.status_code,
+                        endpoint,
+                        summarize_result(data),
+                    )
                 except httpx.HTTPStatusError as exc:
-                    self.logger.warning("HTTP error on %s attempt %d: %s", method, attempt, exc)
+                    endpoint = self.endpoints[self._current_index]
+                    status_code = exc.response.status_code if exc.response is not None else None
+                    delay = self._compute_retry_delay(attempt, status_code)
+                    if status_code in RATE_LIMIT_STATUS_CODES:
+                        self.logger.info(
+                            "Rate limit on %s attempt=%d via %s; backing off %.2fs",
+                            method,
+                            attempt,
+                            endpoint,
+                            delay,
+                        )
+                    else:
+                        self.logger.warning("HTTP error on %s attempt %d via %s: %s", method, attempt, endpoint, exc)
+                    if status_code in ENDPOINT_ROTATION_STATUS_CODES:
+                        self._mark_endpoint_unhealthy(endpoint, 5.0)
+                        rotated = self._rotate_endpoint()
+                        if rotated:
+                            self.logger.warning("Switching RPC endpoint to %s after status %s", rotated, status_code)
+                    else:
+                        self._mark_endpoint_unhealthy(endpoint, 15.0)
+                        self._record_endpoint_failure(endpoint)
                     if attempt >= MAX_RPC_RETRIES:
                         raise RPCError(f"HTTP error on method {method}: {exc}") from exc
                 except httpx.RequestError as exc:
-                    self.logger.warning("Request error on %s attempt %d: %s", method, attempt, exc)
+                    endpoint = self.endpoints[self._current_index]
+                    self.logger.warning("Request error on %s attempt %d via %s: %s", method, attempt, endpoint, exc)
+                    self._mark_endpoint_unhealthy(endpoint, 30.0)
+                    fatal = isinstance(getattr(exc, "__cause__", None), socket.gaierror)
+                    if not fatal:
+                        message = str(exc).lower()
+                        fatal = "getaddrinfo failed" in message or "dns" in message
+                    self._record_endpoint_failure(endpoint, fatal=fatal)
+                    rotated = self._rotate_endpoint()
+                    if rotated:
+                        self.logger.warning("Switching RPC endpoint to %s after request error", rotated)
                     if attempt >= MAX_RPC_RETRIES:
                         raise RPCError(f"Request error on method {method}: {exc}") from exc
+                    delay = self._compute_retry_delay(attempt, None)
                 else:
                     if "error" in data:
                         message = data["error"].get("message", "Unknown RPC error")
                         self.logger.warning("RPC error on %s attempt %d: %s", method, attempt, message)
+                        lower_message = message.lower()
+                        if "cleaned up" in lower_message or "does not exist on node" in lower_message:
+                            endpoint = self.endpoints[self._current_index]
+                            self._mark_endpoint_unhealthy(endpoint, 60.0)
+                            self._record_endpoint_failure(endpoint)
+                            rotated = self._rotate_endpoint()
+                            if rotated:
+                                self.logger.warning(
+                                    "Switching RPC endpoint to %s after history gap on %s",
+                                    rotated,
+                                    endpoint,
+                                )
                         if attempt >= MAX_RPC_RETRIES:
                             raise RPCError(f"RPC error on method {method}: {message}")
+                        delay = self._compute_retry_delay(attempt, None)
                     else:
+                        if endpoint in self._unhealthy:
+                            self._unhealthy.pop(endpoint, None)
+                        self._cleanup_unhealthy()
                         return data.get("result")
 
-            await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            if attempt >= MAX_RPC_RETRIES:
+                break
+            if delay is None:
+                delay = self._compute_retry_delay(attempt, None)
+            await asyncio.sleep(delay)
 
     def _next_id(self) -> int:
         self._request_id += 1
         return self._request_id
 
+    def _rotate_endpoint(self) -> Optional[str]:
+        if len(self.endpoints) == 1:
+            return None
+        self._cleanup_unhealthy()
+        starting_index = self._current_index
+        for _ in range(len(self.endpoints)):
+            self._current_index = (self._current_index + 1) % len(self.endpoints)
+            endpoint = self.endpoints[self._current_index]
+            expiry = self._unhealthy.get(endpoint)
+            if expiry is not None and time.monotonic() < expiry:
+                continue
+            return endpoint
+        self._current_index = starting_index
+        return None
 
-def load_config(config_path: Path) -> Dict[str, Any]:
+    def _mark_endpoint_unhealthy(self, endpoint: str, duration: float) -> None:
+        self._unhealthy[endpoint] = time.monotonic() + max(duration, 1.0)
+
+    def _cleanup_unhealthy(self) -> None:
+        now = time.monotonic()
+        expired = [endpoint for endpoint, expiry in self._unhealthy.items() if expiry <= now]
+        for endpoint in expired:
+            self._unhealthy.pop(endpoint, None)
+
+    def _record_endpoint_failure(self, endpoint: str, fatal: bool = False) -> None:
+        count = self._endpoint_failures.get(endpoint, 0) + 1
+        self._endpoint_failures[endpoint] = count
+        if fatal or count >= MAX_ENDPOINT_FAILURES:
+            if len(self.endpoints) <= 1:
+                return
+            try:
+                index = self.endpoints.index(endpoint)
+            except ValueError:
+                self._endpoint_failures.pop(endpoint, None)
+                return
+            self.logger.error(
+                "Removing RPC endpoint %s after %d consecutive failures", endpoint, count
+            )
+            self.endpoints.pop(index)
+            self._unhealthy.pop(endpoint, None)
+            self._endpoint_failures.pop(endpoint, None)
+            if self._current_index >= len(self.endpoints):
+                self._current_index = 0
+
+    def _compute_retry_delay(self, attempt: int, status_code: Optional[int]) -> float:
+        base = RETRY_BACKOFF_SECONDS
+        if status_code in RATE_LIMIT_STATUS_CODES:
+            backoff = base * (2 ** (attempt - 1))
+        else:
+            backoff = base * attempt
+        delay = min(backoff, MAX_RETRY_BACKOFF_SECONDS)
+        jitter = random.uniform(0.0, RETRY_BACKOFF_JITTER)
+        return delay + jitter
+
+
+def load_config(config_path: Path, wallet_config_path: Optional[Path] = None) -> Dict[str, Any]:
     if not config_path.exists():
         raise ConfigurationError(f"Configuration file not found at {config_path}")
     with config_path.open("r", encoding="utf-8") as handle:
@@ -177,24 +336,58 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         except json.JSONDecodeError as exc:
             raise ConfigurationError(f"Invalid JSON in configuration file: {exc}") from exc
 
-    wallet_address = config.get("wallet_address")
+    wallet_config_path = wallet_config_path or (config_path.parent / "wallet_config.json")
+    if not wallet_config_path.exists():
+        raise ConfigurationError(
+            f"Wallet configuration file not found at {wallet_config_path}. "
+            "Create it (optionally by copying wallet_config.example.cfg) and set 'wallet_address'."
+        )
+    with wallet_config_path.open("r", encoding="utf-8") as wallet_handle:
+        try:
+            wallet_config = json.load(wallet_handle)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(f"Invalid JSON in wallet configuration file: {exc}") from exc
+
+    wallet_address = wallet_config.get("wallet_address")
     if not wallet_address:
-        raise ConfigurationError("Configuration must include 'wallet_address'.")
+        raise ConfigurationError("Wallet configuration must include 'wallet_address'.")
     try:
-        PublicKey(wallet_address)
+        Pubkey.from_string(wallet_address)
     except Exception as exc:  # pylint: disable=broad-except
         raise ConfigurationError(f"Invalid wallet address: {wallet_address}") from exc
+    config["wallet_address"] = wallet_address
 
-    rpc_endpoint = config.get("rpc_endpoint") or "https://api.mainnet-beta.solana.com"
-    config["rpc_endpoint"] = rpc_endpoint
+    rpc_endpoint = config.get("rpc_endpoint")
+    rpc_endpoints = config.get("rpc_endpoints")
+    resolved_endpoints: List[str]
+    if rpc_endpoints and isinstance(rpc_endpoints, list):
+        resolved_endpoints = [str(endpoint).strip() for endpoint in rpc_endpoints if endpoint]
+    elif isinstance(rpc_endpoint, str) and rpc_endpoint:
+        resolved_endpoints = [rpc_endpoint.strip()]
+    else:
+        resolved_endpoints = ["https://api.mainnet-beta.solana.com", "https://ssc-dao.genesysgo.net"]
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for endpoint in resolved_endpoints:
+        if not endpoint or endpoint in seen:
+            continue
+        deduped.append(endpoint)
+        seen.add(endpoint)
+    if not deduped:
+        deduped = ["https://api.mainnet-beta.solana.com"]
+    random.shuffle(deduped)
+    config["rpc_endpoints"] = deduped
+    config["rpc_endpoint"] = deduped[0]
 
-    concurrency_limit = safe_int(config.get("concurrency_limit")) or 8
+    concurrency_limit = safe_int(config.get("concurrency_limit")) or 4
     config["concurrency_limit"] = max(1, concurrency_limit)
 
     config.setdefault("output_format", ["console", "json", "csv"])
     config.setdefault("json_output_file", "validator_analysis.json")
     config.setdefault("csv_output_file", "validator_analysis.csv")
     config.setdefault("stake_accounts_csv_output_file", "stake_account_analysis.csv")
+    config.setdefault("max_transaction_signatures", 2000)
+    config.setdefault("transaction_backoff_seconds", 0.35)
     config.setdefault("log_level", "INFO")
 
     return config
@@ -240,7 +433,11 @@ async def fetch_stake_accounts(client: SolanaRPCClient, wallet_address: str, log
         info = parsed.get("info", {})
         stake = info.get("stake", {})
         delegation = stake.get("delegation") or {}
-        validator_vote = delegation.get("voteAccount")
+        validator_vote = (
+            delegation.get("voteAccount")
+            or delegation.get("voter")
+            or delegation.get("votePubkey")
+        )
         delegated_lamports = safe_int(delegation.get("stake")) or 0
         activation_epoch = normalize_epoch(delegation.get("activationEpoch"))
         deactivation_epoch = normalize_epoch(delegation.get("deactivationEpoch"))
@@ -274,6 +471,131 @@ async def fetch_stake_accounts(client: SolanaRPCClient, wallet_address: str, log
 
     logger.info("Discovered %d unique stake accounts", len(accounts))
     return accounts
+
+
+@dataclass
+class DelegationEvent:
+    signature: str
+    slot: Optional[int]
+    block_time: Optional[int]
+    vote_account: str
+    instruction_type: Optional[str]
+    stake_account: Optional[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "signature": self.signature,
+            "slot": self.slot,
+            "block_time": self.block_time,
+            "block_time_iso": datetime.fromtimestamp(self.block_time, tz=timezone.utc).isoformat() if self.block_time else None,
+            "vote_account": self.vote_account,
+            "instruction_type": self.instruction_type,
+            "stake_account": self.stake_account,
+        }
+
+
+async def fetch_delegation_history(
+    client: SolanaRPCClient,
+    stake_accounts: Dict[str, StakeAccount],
+    max_signatures: int,
+    transaction_cache: Dict[str, Any],
+    transaction_backoff_seconds: float,
+    logger: logging.Logger,
+) -> None:
+    for pubkey, account in stake_accounts.items():
+        logger.info("Retrieving delegation history for stake account %s", pubkey)
+        signatures: List[Dict[str, Any]] = []
+        before: Optional[str] = None
+        while len(signatures) < max_signatures:
+            remaining = max_signatures - len(signatures)
+            limit = min(1000, remaining)
+            params: List[Any] = [pubkey, {"limit": limit}]
+            if before:
+                params[1]["before"] = before
+            batch = await client.request("getSignaturesForAddress", params)
+            if not batch:
+                break
+            signatures.extend(batch)
+            if len(batch) < limit:
+                break
+            before = batch[-1].get("signature")
+
+        logger.info("Fetched %d signatures for stake account %s", len(signatures), pubkey)
+
+        account.delegation_history.clear()
+        for sig_info in reversed(signatures):
+            signature = sig_info.get("signature")
+            if not signature:
+                continue
+            tx = transaction_cache.get(signature)
+            if tx is None:
+                tx = await client.request(
+                    "getTransaction",
+                    [
+                        signature,
+                        {
+                            "encoding": "jsonParsed",
+                            "maxSupportedTransactionVersion": 0,
+                        },
+                    ],
+                )
+                if tx:
+                    transaction_cache[signature] = tx
+                await asyncio.sleep(max(transaction_backoff_seconds, 0.0))
+            if not tx:
+                continue
+            block_time = safe_int(tx.get("blockTime"))
+            slot = safe_int(tx.get("slot"))
+            message = ((tx.get("transaction") or {}).get("message")) or {}
+            instructions: List[Dict[str, Any]] = list(message.get("instructions") or [])
+            meta = tx.get("meta") or {}
+            for inner in meta.get("innerInstructions") or []:
+                instructions.extend(inner.get("instructions") or [])
+
+            for instruction in instructions:
+                parsed = instruction.get("parsed") or {}
+                if not parsed:
+                    continue
+                program = instruction.get("program")
+                program_id = instruction.get("programId")
+                if program != "stake" and program_id != STAKE_PROGRAM_ID:
+                    continue
+                info = parsed.get("info") or {}
+                instruction_type = parsed.get("type") or instruction.get("type")
+                vote_account = (
+                    info.get("voteAccount")
+                    or info.get("vote_account")
+                    or info.get("votePubkey")
+                    or info.get("vote_pubkey")
+                )
+                if not vote_account:
+                    continue
+                if instruction_type and "delegate" not in instruction_type.lower():
+                    continue
+                event = DelegationEvent(
+                    signature=signature,
+                    slot=slot,
+                    block_time=block_time,
+                    vote_account=vote_account,
+                    instruction_type=instruction_type,
+                    stake_account=pubkey,
+                )
+                account.delegation_history.append(event)
+
+        if account.validator_vote and all(event.vote_account != account.validator_vote for event in account.delegation_history):
+            account.delegation_history.append(
+                DelegationEvent(
+                    signature="CURRENT_STATE",
+                    slot=None,
+                    block_time=None,
+                    vote_account=account.validator_vote,
+                    instruction_type="current_delegation",
+                    stake_account=pubkey,
+                )
+            )
+
+        unique_validators = list(dict.fromkeys(event.vote_account for event in account.delegation_history))
+        account.historical_validators = unique_validators
 
 
 async def fetch_inflation_rewards(
@@ -426,7 +748,10 @@ def analyze_validators(
     network_validator_rate = float(inflation_rate.get("validator", 0.0))
 
     validator_accounts: Dict[str, List[StakeAccount]] = {}
+    historical_validator_events: Dict[str, List[DelegationEvent]] = {}
     for account in stake_accounts.values():
+        for event in account.delegation_history:
+            historical_validator_events.setdefault(event.vote_account, []).append(event)
         if not account.validator_vote:
             continue
         validator_accounts.setdefault(account.validator_vote, []).append(account)
@@ -460,6 +785,9 @@ def analyze_validators(
                 "commission": commission,
                 "uptime_ratio": uptime,
                 "delinquent": account.validator_delinquent,
+                "historical_validators": account.historical_validators,
+                "delegation_history": [event.to_dict() for event in account.delegation_history],
+                "delegation_event_count": len(account.delegation_history),
             }
         )
 
@@ -512,6 +840,36 @@ def analyze_validators(
                 "wallet_stake_accounts": [acc.pubkey for acc in accounts],
                 "activated_stake_sol": activated_stake,
                 "status": status,
+                "delegation_event_count": len(historical_validator_events.get(validator_vote, [])),
+                "first_delegation_time": _get_first_event_iso(historical_validator_events.get(validator_vote)),
+                "last_delegation_time": _get_last_event_iso(historical_validator_events.get(validator_vote)),
+            }
+        )
+
+    historical_only_validators = set(historical_validator_events.keys()) - set(validator_accounts.keys())
+    for validator_vote in historical_only_validators:
+        events = historical_validator_events[validator_vote]
+        validator_info = validator_lookup.get(validator_vote, {})
+        commission = safe_int(validator_info.get("commission"))
+        uptime = compute_validator_uptime(validator_info, slots_in_epoch) if validator_info else None
+        activated_stake = lamports_to_sol(safe_int(validator_info.get("activatedStake"))) if validator_info else None
+        validator_rows.append(
+            {
+                "validator_vote": validator_vote,
+                "delegated_sol": 0.0,
+                "total_rewards_sol": 0.0,
+                "realized_yield_pct": None,
+                "annualized_yield_pct": None,
+                "expected_yield_pct": compute_validator_expected_yield(commission, network_validator_rate),
+                "commission": commission,
+                "uptime_ratio": uptime,
+                "delinquent": validator_info.get("delinquent") if validator_info else None,
+                "wallet_stake_accounts": list({event.stake_account for event in events if event.stake_account}),
+                "activated_stake_sol": activated_stake,
+                "status": "HISTORICAL_ONLY",
+                "delegation_event_count": len(events),
+                "first_delegation_time": _get_first_event_iso(events),
+                "last_delegation_time": _get_last_event_iso(events),
             }
         )
 
@@ -576,8 +934,17 @@ def write_csv_outputs(
     stake_rows: List[Dict[str, Any]],
     logger: logging.Logger,
 ) -> None:
-    pd.DataFrame(validator_rows).to_csv(validator_path, index=False)
-    pd.DataFrame(stake_rows).to_csv(stake_path, index=False)
+    validator_df = pd.DataFrame(validator_rows)
+    if "wallet_stake_accounts" in validator_df:
+        validator_df["wallet_stake_accounts"] = validator_df["wallet_stake_accounts"].apply(lambda value: ";".join(value) if isinstance(value, list) else value)
+    validator_df.to_csv(validator_path, index=False)
+
+    stake_df = pd.DataFrame(stake_rows)
+    if "historical_validators" in stake_df:
+        stake_df["historical_validators"] = stake_df["historical_validators"].apply(lambda value: ";".join(value) if isinstance(value, list) else value)
+    if "delegation_history" in stake_df:
+        stake_df["delegation_history"] = stake_df["delegation_history"].apply(lambda value: json.dumps(value) if isinstance(value, list) else value)
+    stake_df.to_csv(stake_path, index=False)
     logger.info("Wrote CSV report to %s", validator_path)
     logger.info("Wrote stake account CSV to %s", stake_path)
 
@@ -593,9 +960,29 @@ def compute_average_slot_time_seconds(performance_samples: Optional[List[Dict[st
     return sample_period / num_slots
 
 
+def _get_first_event_iso(events: Optional[List[DelegationEvent]]) -> Optional[str]:
+    if not events:
+        return None
+    ordered = sorted(events, key=lambda event: (event.block_time or 0, event.slot or 0))
+    for event in ordered:
+        if event.block_time:
+            return datetime.fromtimestamp(event.block_time, tz=timezone.utc).isoformat()
+    return None
+
+
+def _get_last_event_iso(events: Optional[List[DelegationEvent]]) -> Optional[str]:
+    if not events:
+        return None
+    ordered = sorted(events, key=lambda event: (event.block_time or 0, event.slot or 0), reverse=True)
+    for event in ordered:
+        if event.block_time:
+            return datetime.fromtimestamp(event.block_time, tz=timezone.utc).isoformat()
+    return None
+
+
 async def run() -> None:
     base_dir = Path(__file__).resolve().parent
-    config = load_config(base_dir / "config.json")
+    config = load_config(base_dir / CONFIG_FILENAME, base_dir / "wallet_config.json")
 
     logging.basicConfig(
         level=getattr(logging, str(config.get("log_level", "INFO")).upper(), logging.INFO),
@@ -605,9 +992,11 @@ async def run() -> None:
     logger = logging.getLogger("solana_staking_analyzer")
 
     wallet_address = config["wallet_address"]
+    transaction_backoff_seconds = float(config.get("transaction_backoff_seconds", 0.35) or 0.35)
+    transaction_cache: Dict[str, Any] = {}
     logger.info("Starting staking analysis for wallet %s", wallet_address)
 
-    async with SolanaRPCClient(config["rpc_endpoint"], config["concurrency_limit"]) as client:
+    async with SolanaRPCClient(config["rpc_endpoints"], config["concurrency_limit"]) as client:
         epoch_info = await client.request("getEpochInfo")
         if not epoch_info:
             raise RPCError("Failed to retrieve epoch info")
@@ -636,6 +1025,15 @@ async def run() -> None:
 
         await enrich_stake_account_metrics(client, stake_accounts, slots_in_epoch, average_slot_time_seconds, logger)
 
+        await fetch_delegation_history(
+            client,
+            stake_accounts,
+            safe_int(config.get("max_transaction_signatures")) or 2000,
+            transaction_cache,
+            transaction_backoff_seconds,
+            logger,
+        )
+
         vote_accounts = await client.request("getVoteAccounts") or {}
         validator_lookup = build_validator_lookup(vote_accounts)
 
@@ -646,6 +1044,7 @@ async def run() -> None:
             "wallet_address": wallet_address,
             "generated_at": timestamp,
             "rpc_endpoint": config["rpc_endpoint"],
+            "rpc_endpoints": config["rpc_endpoints"],
             "current_epoch": current_epoch,
             "absolute_slot": absolute_slot,
             "slots_in_epoch": slots_in_epoch,
