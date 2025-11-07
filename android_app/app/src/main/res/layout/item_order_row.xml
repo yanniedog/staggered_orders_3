@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.cardview.widget.CardView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_margin="4dp"
+    app:cardCornerRadius="4dp"
+    app:cardElevation="2dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="8dp">
+
+        <!-- Rung Number -->
+        <TextView
+            android:id="@+id/textRungNumber"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="0.8"
+            android:text="1"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:gravity="center" />
+
+        <!-- Price -->
+        <TextView
+            android:id="@+id/textPrice"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1.2"
+            android:text="$0.00"
+            android:textSize="12sp"
+            android:gravity="center" />
+
+        <!-- Quantity -->
+        <TextView
+            android:id="@+id/textQuantity"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1.2"
+            android:text="0.0000"
+            android:textSize="12sp"
+            android:gravity="center" />
+
+        <!-- Cost/Revenue -->
+        <TextView
+            android:id="@+id/textCostRevenue"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1.2"
+            android:text="$0.00"
+            android:textSize="12sp"
+            android:gravity="center" />
+
+        <!-- Cumulative -->
+        <TextView
+            android:id="@+id/textCumulative"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1.2"
+            android:text="$0.00"
+            android:textSize="12sp"
+            android:gravity="center" />
+
+        <!-- Average Price -->
+        <TextView
+            android:id="@+id/textAveragePrice"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1.2"
+            android:text="$0.00"
+            android:textSize="12sp"
+            android:gravity="center" />
+
+    </LinearLayout>
+
+</androidx.cardview.widget.CardView>
+

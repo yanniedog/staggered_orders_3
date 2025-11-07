@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <xml name="backup_rules" translatable="false">
+        <full-backup-content>
+            <!-- Exclude nothing -->
+        </full-backup-content>
+    </xml>
+</resources>
+
