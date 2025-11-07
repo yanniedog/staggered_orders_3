@@ -1,0 +1,10 @@
+{
+  "wallet_address": "ReplaceWithYourSolWalletAddress",
+  "rpc_endpoint": "https://api.mainnet-beta.solana.com",
+  "concurrency_limit": 8,
+  "output_format": ["console", "json", "csv"],
+  "json_output_file": "validator_analysis.json",
+  "csv_output_file": "validator_analysis.csv",
+  "log_level": "INFO"
+}
+

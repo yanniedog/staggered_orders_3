@@ -351,6 +351,9 @@ def create_excel_calculator(filename: str = "staggered_ladder_calculator.xlsx"):
         ('Buy Price Range (%)', 30, '0.00', 'Price range for buy ladder (0-100%)')
     ]
     
+    # Extract default num_rungs for row hiding
+    default_num_rungs = input_data[3][1]  # Get default value from 'Number of Rungs'
+    
     input_start_row = row
     for i, (label, default_val, num_format, hint) in enumerate(input_data):
         # Label
@@ -393,7 +396,10 @@ def create_excel_calculator(filename: str = "staggered_ladder_calculator.xlsx"):
     row += 1
     
     summary_start_row = row
-    buy_start_row = 35  # Where buy orders table starts
+    
+    # Calculate buy_start_row position (after summary section + spacing)
+    # Summary has 8 rows (title + 8 data rows), plus 2 rows spacing = 10 rows
+    buy_start_row = summary_start_row + 8 + 2  # Summary rows + spacing
     sell_start_row = buy_start_row + 25  # Where sell orders table starts
     
     summary_formulas = [
@@ -431,15 +437,7 @@ def create_excel_calculator(filename: str = "staggered_ladder_calculator.xlsx"):
         ws.row_dimensions[row].height = 18
         row += 1
     
-    row += 1
-    
-    # ========== VALIDATION SECTION ==========
-    validation_row = row
-    ws[f'A{validation_row}'] = "VALIDATION STATUS"
-    ws[f'A{validation_row}'].font = section_font
-    ws.merge_cells(f'A{validation_row}:D{validation_row}')
-    ws.row_dimensions[validation_row].height = 22
-    validation_row += 1
+    row += 2  # Add small spacing after summary
     
     # Create Helpers sheet and move all helper calculations there
     ws_helpers = wb.create_sheet("Helpers")
@@ -460,26 +458,14 @@ def create_excel_calculator(filename: str = "staggered_ladder_calculator.xlsx"):
     initial_revenue_ref = helper_refs['initial_revenue_ref']
     price_scale_ref = helper_refs['price_scale_ref']
     min_valid_sell_ref = helper_refs['min_valid_sell_ref']
-    validation_status_ref = helper_refs.get('validation_status_ref', '')
-    
-    # Display validation status summary (references Helpers sheet)
-    ws[f'A{validation_row}'] = "VALIDATION STATUS"
-    ws[f'A{validation_row}'].font = section_font
-    ws.merge_cells(f'A{validation_row}:D{validation_row}')
-    ws.row_dimensions[validation_row].height = 22
-    validation_row += 1
-    
-    ws[f'A{validation_row}'] = "See 'Helpers' sheet for detailed validation checks"
-    ws[f'A{validation_row}'].font = Font(size=9, italic=True, color="666666")
-    ws.merge_cells(f'A{validation_row}:D{validation_row}')
-    validation_row += 1
     
     # ========== BUY ORDERS SECTION ==========
+    # Start buy orders right after summary (no validation section needed - it's in Helpers sheet)
     row = buy_start_row - 1
     ws[f'A{row}'] = "BUY ORDERS"
     ws[f'A{row}'].font = section_font
     ws[f'A{row}'].fill = buy_fill
-    ws.merge_cells(f'A{row}:K{row}')
+    ws.merge_cells(f'A{row}:J{row}')
     ws.row_dimensions[row].height = 22
     row += 1
     
@@ -571,23 +557,23 @@ def create_excel_calculator(filename: str = "staggered_ladder_calculator.xlsx"):
         ws.cell(row=data_row, column=10).border = border
         ws.cell(row=data_row, column=10).fill = buy_fill
         
-        # Show column (column 11) - for filtering
-        # Show row if: rung <= num_rungs AND buy price > 0 AND quantity > 0 (valid data)
-        show_formula = f'=IF(AND(A{data_row}<={num_rungs_ref},B{data_row}>0,G{data_row}>0,ISNUMBER(B{data_row}),ISNUMBER(G{data_row})),"Yes","No")'
-        ws.cell(row=data_row, column=11).value = show_formula
+        # Hide rows that should not be shown (rung > default num_rungs)
+        # Set row height to 0 to effectively hide rows beyond default num_rungs
+        if rung_num > default_num_rungs:
+            ws.row_dimensions[data_row].height = 0
+            ws.row_dimensions[data_row].hidden = True
     
     # Hide helper columns (C, D, E)
     ws.column_dimensions['C'].width = 0.1
     ws.column_dimensions['D'].width = 0.1
     ws.column_dimensions['E'].width = 0.1
-    ws.column_dimensions['K'].width = 0.1  # Hide Show column
     
     # ========== SELL ORDERS SECTION ==========
     row = sell_start_row - 1
     ws[f'A{row}'] = "SELL ORDERS"
     ws[f'A{row}'].font = section_font
     ws[f'A{row}'].fill = sell_fill
-    ws.merge_cells(f'A{row}:L{row}')
+    ws.merge_cells(f'A{row}:K{row}')
     ws.row_dimensions[row].height = 22
     row += 1
     
@@ -684,25 +670,17 @@ def create_excel_calculator(filename: str = "staggered_ladder_calculator.xlsx"):
         ws.cell(row=data_row, column=11).border = border
         ws.cell(row=data_row, column=11).fill = sell_fill
         
-        # Show column (column 12) - for filtering
-        # Show row if: rung <= num_rungs AND sell price > 0 AND quantity > 0 (valid data)
-        show_formula = f'=IF(AND(A{data_row}<={num_rungs_ref},C{data_row}>0,G{data_row}>0,ISNUMBER(C{data_row}),ISNUMBER(G{data_row})),"Yes","No")'
-        ws.cell(row=data_row, column=12).value = show_formula
+        # Hide rows that should not be shown (rung > default num_rungs)
+        # Set row height to 0 to effectively hide rows beyond default num_rungs
+        if rung_num > default_num_rungs:
+            ws.row_dimensions[data_row].height = 0
+            ws.row_dimensions[data_row].hidden = True
     
-    # Hide helper columns (B, D, E, F, L)
+    # Hide helper columns (B, D, E, F)
     ws.column_dimensions['B'].width = 0.1  # Initial price
     ws.column_dimensions['D'].width = 0.1  # Weight
     ws.column_dimensions['E'].width = 0.1  # Norm weight
     ws.column_dimensions['F'].width = 0.1  # Qty before norm
-    ws.column_dimensions['L'].width = 0.1  # Show column
-    
-    # Apply AutoFilter to buy orders table
-    buy_table_range = f'A{buy_start_row-1}:K{buy_start_row+19}'
-    ws.auto_filter.ref = buy_table_range
-    
-    # Apply AutoFilter to sell orders table  
-    sell_table_range = f'A{sell_start_row-1}:L{sell_start_row+19}'
-    ws.auto_filter.ref = sell_table_range
     
     # Auto-adjust column widths for visible columns
     visible_cols = ['A', 'B', 'F', 'G', 'H', 'I', 'J', 'K', 'C']  # C is sell price
@@ -744,11 +722,11 @@ def create_excel_calculator(filename: str = "staggered_ladder_calculator.xlsx"):
     instructions = [
         "1. Enter your parameters in the INPUT PARAMETERS section at the top.",
         "2. Review the SUMMARY RESULTS to see total cost, revenue, and profit.",
-        "3. Check VALIDATION STATUS to ensure all inputs are valid.",
+        "3. Check the 'Helpers' sheet for validation checks and detailed calculations.",
         "4. View BUY ORDERS and SELL ORDERS tables below.",
-        "5. Filters are applied automatically - only active rungs are shown.",
+        "5. Only active rungs (based on Number of Rungs) are shown - excess rows are hidden.",
         "6. See the Charts sheet for visualizations.",
-        "7. Helper calculations are hidden but can be viewed by unhiding columns."
+        "7. Helper calculations are in the 'Helpers' sheet (protected from modification)."
     ]
     
     for instruction in instructions:
@@ -759,51 +737,6 @@ def create_excel_calculator(filename: str = "staggered_ladder_calculator.xlsx"):
     
     wb.save(filename)
     logger.info(f"Excel calculator created: {filename}")
-    
-    # Apply filter criteria using COM automation
-    try:
-        apply_filter_criteria(filename, buy_start_row, sell_start_row)
-    except ImportError:
-        logger.info("win32com not available. Filters will need to be applied manually.")
-    except Exception as e:
-        logger.warning(f"Could not apply filter criteria: {e}")
-
-def apply_filter_criteria(filename, buy_start_row, sell_start_row):
-    """Apply filter criteria to show only active rows. Uses COM automation."""
-    import os
-    
-    try:
-        import win32com.client
-    except ImportError:
-        raise ImportError("win32com not available")
-    
-    try:
-        abs_path = os.path.abspath(filename)
-        
-        xl = win32com.client.Dispatch("Excel.Application")
-        xl.Visible = False
-        xl.DisplayAlerts = False
-        
-        wb_com = xl.Workbooks.Open(abs_path)
-        ws_com = wb_com.Worksheets("Calculator")
-        
-        # Apply filter criteria to Buy Orders table (column K = 11)
-        buy_range = ws_com.Range(f'A{buy_start_row-1}:K{buy_start_row+19}')
-        buy_range.AutoFilter(Field=11, Criteria1="Yes")
-        
-        # Apply filter criteria to Sell Orders table (column L = 12)
-        sell_range = ws_com.Range(f'A{sell_start_row-1}:L{sell_start_row+19}')
-        sell_range.AutoFilter(Field=12, Criteria1="Yes")
-        
-        wb_com.Save()
-        wb_com.Close()
-        xl.Quit()
-        
-        logger.info("Filter criteria applied successfully")
-        
-    except Exception as e:
-        logger.warning(f"Could not apply filter criteria: {e}")
-        raise
 
 def create_charts_sheet(wb, buy_start_row, sell_start_row, num_rungs_ref):
     """Create charts sheet with visualizations matching Python version - completely redesigned."""
