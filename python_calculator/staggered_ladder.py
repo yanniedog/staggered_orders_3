@@ -628,13 +628,27 @@ def generate_excel(results: Dict, filename: str):
     
     row += 1
     
-    # Buy orders header
-    ws[f'A{row}'] = "Buy Orders"
-    ws[f'A{row}'].font = Font(bold=True, size=14)
+    # Combined buy/sell orders headers
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    ws.merge_cells(start_row=row, start_column=7, end_row=row, end_column=11)
+    ws.cell(row=row, column=1).value = "Buy Orders"
+    ws.cell(row=row, column=1).font = Font(bold=True, size=14)
+    ws.cell(row=row, column=7).value = "Sell Orders"
+    ws.cell(row=row, column=7).font = Font(bold=True, size=14)
     row += 1
     
-    headers = ['Buy Price', 'Quantity', 'Cost', 'Cumulative Cost', 'Avg Buy Price']
-    for col_idx, header in enumerate(headers, start=1):
+    buy_headers = ['Buy Price', 'Quantity', 'Cost', 'Cumulative Cost', 'Avg Buy Price']
+    sell_headers = ['Sell Price', 'Quantity', 'Revenue', 'Cumulative Revenue', 'Avg Sell Price']
+    
+    for col_idx, header in enumerate(buy_headers, start=1):
+        cell = ws.cell(row=row, column=col_idx)
+        cell.value = header
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center')
+    
+    for col_idx, header in enumerate(sell_headers, start=7):
         cell = ws.cell(row=row, column=col_idx)
         cell.value = header
         cell.fill = header_fill
@@ -650,50 +664,50 @@ def generate_excel(results: Dict, filename: str):
     cumulative_buy_cost_reversed = list(reversed(results['cumulative_buy_cost']))
     avg_buy_prices_reversed = list(reversed(results['avg_buy_prices']))
     
-    for i in range(results['num_rungs']):
-        ws.cell(row=row, column=1).value = buy_prices_reversed[i]
-        ws.cell(row=row, column=2).value = buy_quantities_reversed[i]
-        ws.cell(row=row, column=3).value = buy_prices_reversed[i] * buy_quantities_reversed[i]
-        ws.cell(row=row, column=4).value = cumulative_buy_cost_reversed[i]
-        ws.cell(row=row, column=5).value = avg_buy_prices_reversed[i]
+    sell_prices = list(results['sell_prices'])
+    sell_quantities = list(results['sell_quantities'])
+    cumulative_sell_revenue = list(results['cumulative_sell_revenue'])
+    avg_sell_prices = list(results['avg_sell_prices'])
+    
+    max_rows = max(len(buy_prices_reversed), len(sell_prices))
+    
+    for i in range(max_rows):
+        buy_col_start = 1
+        sell_col_start = 7
         
-        for col in range(1, 6):
-            ws.cell(row=row, column=col).border = border
-            ws.cell(row=row, column=col).number_format = '#,##0.00'
+        if i < len(buy_prices_reversed):
+            ws.cell(row=row, column=buy_col_start + 0).value = buy_prices_reversed[i]
+            ws.cell(row=row, column=buy_col_start + 1).value = buy_quantities_reversed[i]
+            ws.cell(row=row, column=buy_col_start + 2).value = buy_prices_reversed[i] * buy_quantities_reversed[i]
+            ws.cell(row=row, column=buy_col_start + 3).value = cumulative_buy_cost_reversed[i]
+            ws.cell(row=row, column=buy_col_start + 4).value = avg_buy_prices_reversed[i]
+            for col_offset in range(5):
+                cell = ws.cell(row=row, column=buy_col_start + col_offset)
+                cell.border = border
+                if col_offset == 1:
+                    cell.number_format = '#,##0.0000'
+                else:
+                    cell.number_format = '#,##0.00'
         
-        row += 1
-    
-    row += 1
-    
-    # Sell orders header
-    ws[f'A{row}'] = "Sell Orders"
-    ws[f'A{row}'].font = Font(bold=True, size=14)
-    row += 1
-    
-    headers = ['Sell Price', 'Quantity', 'Revenue', 'Cumulative Revenue', 'Avg Sell Price']
-    for col_idx, header in enumerate(headers, start=1):
-        cell = ws.cell(row=row, column=col_idx)
-        cell.value = header
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.border = border
-        cell.alignment = Alignment(horizontal='center')
-    
-    row += 1
-    
-    # Sell orders data
-    for i in range(results['num_rungs']):
-        ws.cell(row=row, column=1).value = results['sell_prices'][i]
-        ws.cell(row=row, column=2).value = results['sell_quantities'][i]
-        ws.cell(row=row, column=3).value = results['sell_prices'][i] * results['sell_quantities'][i]
-        ws.cell(row=row, column=4).value = results['cumulative_sell_revenue'][i]
-        ws.cell(row=row, column=5).value = results['avg_sell_prices'][i]
-        
-        for col in range(1, 6):
-            ws.cell(row=row, column=col).border = border
-            ws.cell(row=row, column=col).number_format = '#,##0.00'
+        if i < len(sell_prices):
+            ws.cell(row=row, column=sell_col_start + 0).value = sell_prices[i]
+            ws.cell(row=row, column=sell_col_start + 1).value = sell_quantities[i]
+            ws.cell(row=row, column=sell_col_start + 2).value = sell_prices[i] * sell_quantities[i]
+            ws.cell(row=row, column=sell_col_start + 3).value = cumulative_sell_revenue[i]
+            ws.cell(row=row, column=sell_col_start + 4).value = avg_sell_prices[i]
+            for col_offset in range(5):
+                cell = ws.cell(row=row, column=sell_col_start + col_offset)
+                cell.border = border
+                if col_offset == 1:
+                    cell.number_format = '#,##0.0000'
+                else:
+                    cell.number_format = '#,##0.00'
         
         row += 1
+    
+    # Set a narrow width for the separator column
+    separator_column_letter = get_column_letter(6)
+    ws.column_dimensions[separator_column_letter].width = 3
     
     # Auto-adjust column widths
     for col_idx, column in enumerate(ws.columns, start=1):
@@ -705,11 +719,25 @@ def generate_excel(results: Dict, filename: str):
         column_letter = get_column_letter(col_idx)
         for cell in column:
             try:
-                if not isinstance(cell, MergedCell) and cell.value is not None:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-            except:
-                pass
+                if isinstance(cell, MergedCell) or cell.value is None:
+                    continue
+                
+                display_value = str(cell.value)
+                if isinstance(cell.value, (int, float)):
+                    number_format = (cell.number_format or '').replace('"', '')
+                    if number_format == '#,##0.00':
+                        display_value = f"{cell.value:,.2f}"
+                    elif number_format == '#,##0.0000':
+                        display_value = f"{cell.value:,.4f}"
+                    elif number_format == '#,##0':
+                        display_value = f"{cell.value:,.0f}"
+                    else:
+                        display_value = f"{cell.value}"
+                
+                if len(display_value) > max_length:
+                    max_length = len(display_value)
+            except Exception:
+                continue
         if max_length > 0:
             adjusted_width = min(max_length + 2, 50)
             ws.column_dimensions[column_letter].width = adjusted_width
