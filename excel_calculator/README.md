@@ -51,3 +51,4 @@ Generated Excel files are typically saved in the parent directory. The calculato
 - Auto-filtering of active rungs
 - Validation checks
 
+

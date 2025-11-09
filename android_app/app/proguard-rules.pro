@@ -8,3 +8,4 @@
 # Keep Calculator class
 -keep class com.staggeredladder.Calculator { *; }
 
+

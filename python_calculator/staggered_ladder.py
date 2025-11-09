@@ -8,19 +8,13 @@ or profit targets. Outputs results to Excel and PDF with visualizations.
 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
 import logging
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 import sys
 import os
 import argparse
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.chart import LineChart, Reference
-from openpyxl.utils import get_column_letter
-from openpyxl.cell.cell import MergedCell
+from dataclasses import dataclass
 
 # Configure logging
 logging.basicConfig(
@@ -259,6 +253,9 @@ class StaggeredLadderCalculator:
             else:
                 avg_buy_price = 0.0
             
+            cumulative_buy_cost.append(total_cost_from_level)
+            cumulative_buy_qty.append(total_qty_from_level)
+            
             # Validate average is within expected range (weighted average should be between min and max)
             prices_in_range = [self.buy_prices[j] for j in range(i, self.num_rungs)]
             if prices_in_range:
@@ -307,17 +304,10 @@ class StaggeredLadderCalculator:
             avg_sell_prices.append(avg_sell_price)
         
         # Calculate cumulative values (for display purposes)
-        running_buy_cost = 0
-        running_buy_qty = 0
         running_sell_revenue = 0
         running_sell_qty = 0
         
         for i in range(self.num_rungs):
-            running_buy_cost += self.buy_quantities[i] * self.buy_prices[i]
-            running_buy_qty += self.buy_quantities[i]
-            cumulative_buy_cost.append(running_buy_cost)
-            cumulative_buy_qty.append(running_buy_qty)
-            
             running_sell_revenue += self.sell_quantities[i] * self.sell_prices[i]
             running_sell_qty += self.sell_quantities[i]
             cumulative_sell_revenue.append(running_sell_revenue)
@@ -405,7 +395,7 @@ class StaggeredLadderCalculator:
             if avg_sell_prices[i] < avg_sell_prices[i-1]:
                 logger.warning(f"Sell average decreases at index {i}: {avg_sell_prices[i-1]:.2f} -> {avg_sell_prices[i]:.2f}")
         
-        total_cost = cumulative_buy_cost[-1]
+        total_cost = cumulative_buy_cost[0] if cumulative_buy_cost else 0.0
         total_revenue = cumulative_sell_revenue[-1]
         total_profit = total_revenue - total_cost
         profit_pct = (total_profit / total_cost * 100) if total_cost > 0 else 0
@@ -432,6 +422,11 @@ class StaggeredLadderCalculator:
 
 def generate_excel(results: Dict, filename: str):
     """Generate Excel file with order ladder and statistics."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.cell.cell import MergedCell
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Order Ladder"
@@ -459,6 +454,7 @@ def generate_excel(results: Dict, filename: str):
     
     summary_data = [
         ['Total Budget', f"${results['budget']:,.2f}"],
+        ['Starting Price', f"${results['buy_prices'][-1]:,.2f}" if results['buy_prices'] else "$0.00"],
         ['Number of Rungs', results['num_rungs']],
         ['Total Cost', f"${results['total_cost']:,.2f}"],
         ['Total Revenue', f"${results['total_revenue']:,.2f}"],
@@ -564,415 +560,550 @@ def generate_excel(results: Dict, filename: str):
     logger.info(f"Excel file saved: {filename}")
 
 
+@dataclass(frozen=True)
+class OrderSideConfig:
+    side: str
+    order_label: str
+    price_key: str
+    quantity_key: str
+    cumulative_key: str
+    average_key: str
+    table_title: str
+    chart_title: str
+    individual_label: str
+    average_label: str
+    xlabel: str
+    column_labels: List[str]
+    price_line_color: str
+    average_line_color: str
+    price_axis_color: str
+    price_annotation_color: str
+    quantity_line_color: str
+    quantity_area_color: str
+    quantity_axis_color: str
+    quantity_annotation_color: str
+    reverse_for_display: bool = False
+
+
+def _prepare_order_sequences(results: Dict, config: OrderSideConfig) -> Tuple[List[float], List[float], List[float], List[float]]:
+    prices = list(results.get(config.price_key, []))
+    quantities = list(results.get(config.quantity_key, []))
+    cumulative = list(results.get(config.cumulative_key, []))
+    averages = list(results.get(config.average_key, []))
+
+    if config.reverse_for_display:
+        prices.reverse()
+        quantities.reverse()
+        cumulative.reverse()
+        averages.reverse()
+
+    return prices, quantities, cumulative, averages
+
+
+def _build_table_rows(prices: List[float], quantities: List[float], cumulative: List[float], averages: List[float]) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for price, qty, cum, avg in zip(prices, quantities, cumulative, averages):
+        rows.append([
+            f"${price:,.2f}",
+            f"{qty:,.4f}",
+            f"${price * qty:,.2f}",
+            f"${cum:,.2f}",
+            f"${avg:,.2f}"
+        ])
+    return rows
+
+
+def _create_summary_figure(results: Dict, configs: Tuple[OrderSideConfig, OrderSideConfig]):
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.text(
+        0.5,
+        0.95,
+        'Staggered Order Ladder',
+        ha='center',
+        fontsize=16,
+        fontweight='bold'
+    )
+
+    summary_text = (
+        f"\nSummary:\n"
+        f"  Total Budget: ${results['budget']:,.2f}\n"
+        f"  Number of Rungs: {results['num_rungs']}\n"
+        f"  Total Cost: ${results['total_cost']:,.2f}\n"
+        f"  Total Revenue: ${results['total_revenue']:,.2f}\n"
+        f"  Total Profit: ${results['total_profit']:,.2f}\n"
+        f"  Profit Percentage: {results['profit_pct']:.2f}%\n"
+    )
+
+    fig.text(
+        0.1,
+        0.85,
+        summary_text,
+        fontsize=10,
+        family='monospace',
+        verticalalignment='top'
+    )
+
+    for index, config in enumerate(configs, start=1):
+        ax = fig.add_subplot(2, 1, index)
+        ax.axis('tight')
+        ax.axis('off')
+
+        prices, quantities, cumulative, averages = _prepare_order_sequences(results, config)
+        table_data = _build_table_rows(prices, quantities, cumulative, averages)
+
+        table = ax.table(
+            cellText=table_data,
+            colLabels=config.column_labels,
+            cellLoc='center',
+            loc='center'
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.5)
+        ax.set_title(config.table_title, fontweight='bold', pad=20)
+
+    plt.tight_layout()
+    return fig
+
+
+def _create_order_graph_figure(results: Dict, config: OrderSideConfig):
+    import matplotlib.pyplot as plt
+
+    prices, quantities, _, averages = _prepare_order_sequences(results, config)
+    fig, ax_price = plt.subplots(figsize=(11, 8.5))
+
+    if not prices:
+        ax_price.text(
+            0.5,
+            0.5,
+            f"No {config.side} order data available.",
+            transform=ax_price.transAxes,
+            ha='center',
+            va='center',
+            fontsize=14,
+            fontweight='bold'
+        )
+        ax_price.axis('off')
+        return fig
+
+    x_positions = list(range(len(prices)))
+    ax_qty = ax_price.twinx()
+
+    ax_qty.fill_between(
+        x_positions,
+        [0] * len(quantities),
+        quantities,
+        alpha=0.2,
+        color=config.quantity_area_color,
+        label='Quantity',
+        step='mid'
+    )
+    ax_qty.plot(
+        x_positions,
+        quantities,
+        marker='^',
+        markersize=5,
+        linewidth=1.5,
+        color=config.quantity_line_color,
+        linestyle=':',
+        alpha=0.7
+    )
+    ax_qty.set_ylabel('Quantity', fontsize=12, fontweight='bold', color=config.quantity_axis_color)
+    ax_qty.tick_params(axis='y', labelcolor=config.quantity_axis_color)
+
+    ax_price.plot(
+        x_positions,
+        prices,
+        marker='o',
+        linewidth=2.5,
+        markersize=9,
+        color=config.price_line_color,
+        label=config.individual_label,
+        linestyle='-',
+        zorder=3
+    )
+    ax_price.plot(
+        x_positions,
+        averages,
+        marker='s',
+        linewidth=2.5,
+        markersize=7,
+        color=config.average_line_color,
+        label=config.average_label,
+        linestyle='--',
+        zorder=3
+    )
+    ax_price.set_ylabel('Price ($)', fontsize=12, fontweight='bold', color=config.price_axis_color)
+    ax_price.tick_params(axis='y', labelcolor=config.price_axis_color)
+    ax_price.set_title(config.chart_title, fontsize=14, fontweight='bold')
+    ax_price.grid(True, alpha=0.3, axis='both', linestyle='--', linewidth=0.5)
+
+    for idx in range(0, len(x_positions), 2):
+        ax_price.annotate(
+            f'${prices[idx]:.0f}',
+            xy=(x_positions[idx], prices[idx]),
+            xytext=(0, 10),
+            textcoords='offset points',
+            fontsize=8,
+            ha='center',
+            color=config.price_annotation_color,
+            alpha=0.7
+        )
+
+    top_quantity_indices = sorted(
+        range(len(quantities)),
+        key=lambda i: quantities[i],
+        reverse=True
+    )[:3]
+    for idx in top_quantity_indices:
+        ax_qty.annotate(
+            f'{quantities[idx]:.1f}',
+            xy=(x_positions[idx], quantities[idx]),
+            xytext=(0, 5),
+            textcoords='offset points',
+            fontsize=8,
+            ha='center',
+            color=config.quantity_annotation_color,
+            fontweight='bold',
+            alpha=0.8
+        )
+
+    ax_price.set_xticks(x_positions)
+    ax_price.set_xticklabels(
+        [f'{config.order_label} {idx + 1}' for idx in range(len(prices))],
+        rotation=0,
+        ha='center',
+        fontsize=10
+    )
+    ax_price.set_xlabel(config.xlabel, fontsize=12, fontweight='bold')
+
+    lines_price, labels_price = ax_price.get_legend_handles_labels()
+    lines_qty, labels_qty = ax_qty.get_legend_handles_labels()
+    ax_price.legend(
+        lines_price + lines_qty,
+        labels_price + labels_qty,
+        loc='upper left',
+        fontsize=10,
+        framealpha=0.9,
+        edgecolor='gray',
+        fancybox=True
+    )
+
+    plt.tight_layout()
+    return fig
+
+
+def _calculate_point_sizes(buy_quantities: List[float], sell_quantities: List[float]) -> Tuple[List[float], List[float], float, float]:
+    all_quantities = buy_quantities + sell_quantities
+    if not all_quantities:
+        return [], [], 0.0, 0.0
+
+    min_qty = min(all_quantities)
+    max_qty = max(all_quantities)
+    qty_range = max_qty - min_qty if max_qty > min_qty else 1
+
+    min_point_size = 50
+    max_point_size = 500
+
+    def scale_size(qty: float) -> float:
+        if qty_range == 0:
+            return (min_point_size + max_point_size) / 2
+        normalized = (qty - min_qty) / qty_range
+        return min_point_size + normalized * (max_point_size - min_point_size)
+
+    buy_point_sizes = [scale_size(qty) for qty in buy_quantities]
+    sell_point_sizes = [scale_size(qty) for qty in sell_quantities]
+
+    return buy_point_sizes, sell_point_sizes, min_qty, max_qty
+
+
+def _calculate_bar_width(positions: List[float]) -> float:
+    if not positions:
+        return 1
+    if len(positions) > 1:
+        return (positions[1] - positions[0]) * 0.8
+    return abs(positions[0]) * 0.1 if positions[0] != 0 else 1
+
+
+def _calculate_volume_bars(y_min_price: float, y_range_price: float, buy_volumes: List[float], sell_volumes: List[float]) -> Tuple[float, List[float], List[float]]:
+    all_volumes = buy_volumes + sell_volumes
+    max_volume = max(all_volumes) if all_volumes else 1
+    volume_bar_height = y_range_price * 0.15 if y_range_price else 1
+    volume_scale = volume_bar_height / max_volume if max_volume > 0 else 1
+
+    volume_bottom = y_min_price - y_range_price * 0.05 if y_range_price else y_min_price - 0.5
+    buy_volume_heights = [vol * volume_scale for vol in buy_volumes]
+    sell_volume_heights = [vol * volume_scale for vol in sell_volumes]
+
+    return volume_bottom, buy_volume_heights, sell_volume_heights
+
+
+def _create_combined_ladder_figure(results: Dict):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(11, 8.5))
+
+    buy_prices = list(results.get('buy_prices', []))
+    buy_quantities = list(results.get('buy_quantities', []))
+    avg_buy_prices = list(results.get('avg_buy_prices', []))
+
+    sell_prices = list(results.get('sell_prices', []))
+    sell_quantities = list(results.get('sell_quantities', []))
+    avg_sell_prices = list(results.get('avg_sell_prices', []))
+
+    if buy_prices and avg_buy_prices:
+        highest_index = len(buy_prices) - 1
+        if abs(avg_buy_prices[highest_index] - buy_prices[highest_index]) > 0.01:
+            logger.warning(
+                "Graph: Highest buy average %.2f != highest buy price %.2f",
+                avg_buy_prices[highest_index],
+                buy_prices[highest_index]
+            )
+
+    if sell_prices and avg_sell_prices:
+        if abs(avg_sell_prices[0] - sell_prices[0]) > 0.01:
+            logger.warning(
+                "Graph: First sell average %.2f != first sell price %.2f, correcting...",
+                avg_sell_prices[0],
+                sell_prices[0]
+            )
+            avg_sell_prices = list(avg_sell_prices)
+            avg_sell_prices[0] = sell_prices[0]
+
+    if not (buy_prices and sell_prices):
+        ax.text(
+            0.5,
+            0.5,
+            "Insufficient order data for combined ladder chart.",
+            transform=ax.transAxes,
+            ha='center',
+            va='center',
+            fontsize=14,
+            fontweight='bold'
+        )
+        ax.axis('off')
+        return fig
+
+    buy_point_sizes, sell_point_sizes, min_qty, max_qty = _calculate_point_sizes(buy_quantities, sell_quantities)
+
+    min_buy_price = min(buy_prices)
+    max_buy_price = max(buy_prices)
+    min_sell_price = min(sell_prices)
+    max_sell_price = max(sell_prices)
+
+    price_midpoint = (max_buy_price + min_sell_price) / 2
+
+    buy_x_positions = [price - price_midpoint for price in buy_prices]
+    sell_x_positions = [price - price_midpoint for price in sell_prices]
+
+    buy_volumes = [qty * price for qty, price in zip(buy_quantities, buy_prices)]
+    sell_volumes = [qty * price for qty, price in zip(sell_quantities, sell_prices)]
+
+    y_min_price = min(min(avg_buy_prices), min(avg_sell_prices))
+    y_max_price = max(max(avg_buy_prices), max(avg_sell_prices))
+    y_range_price = y_max_price - y_min_price
+
+    buy_bar_width = _calculate_bar_width(buy_x_positions)
+    sell_bar_width = _calculate_bar_width(sell_x_positions)
+
+    volume_bottom, buy_volume_heights, sell_volume_heights = _calculate_volume_bars(
+        y_min_price,
+        y_range_price,
+        buy_volumes,
+        sell_volumes
+    )
+
+    ax.bar(
+        buy_x_positions,
+        buy_volume_heights,
+        width=buy_bar_width,
+        bottom=volume_bottom,
+        alpha=0.5,
+        color='#81C784',
+        edgecolor='#2E7D32',
+        linewidth=1,
+        label='Buy Volume',
+        zorder=2
+    )
+
+    ax.bar(
+        sell_x_positions,
+        sell_volume_heights,
+        width=sell_bar_width,
+        bottom=volume_bottom,
+        alpha=0.5,
+        color='#EF5350',
+        edgecolor='#C62828',
+        linewidth=1,
+        label='Sell Volume',
+        zorder=2
+    )
+
+    ax.scatter(
+        buy_x_positions,
+        avg_buy_prices,
+        s=buy_point_sizes,
+        alpha=0.6,
+        color='#2E7D32',
+        edgecolors='#1B5E20',
+        linewidths=1.5,
+        label='Buy Orders',
+        zorder=3
+    )
+
+    ax.scatter(
+        sell_x_positions,
+        avg_sell_prices,
+        s=sell_point_sizes,
+        alpha=0.6,
+        color='#C62828',
+        edgecolors='#B71C1C',
+        linewidths=1.5,
+        label='Sell Orders',
+        zorder=3
+    )
+
+    ax.axvline(x=0, color='gray', linestyle='--', linewidth=2, alpha=0.7, zorder=1)
+
+    all_x_positions = buy_x_positions + sell_x_positions
+    x_min = min(all_x_positions)
+    x_max = max(all_x_positions)
+    x_range = x_max - x_min
+    x_padding = x_range * 0.05
+    ax.set_xlim(x_min - x_padding, x_max + x_padding)
+
+    max_volume_bar_height = max(
+        max(buy_volume_heights) if buy_volume_heights else 0,
+        max(sell_volume_heights) if sell_volume_heights else 0
+    )
+    volume_bar_top = volume_bottom + max_volume_bar_height
+    y_min_with_volume = min(volume_bottom, y_min_price) - y_range_price * 0.02
+    y_max_with_volume = max(volume_bar_top, y_max_price) + y_range_price * 0.02
+    ax.set_ylim(y_min_with_volume, y_max_with_volume)
+
+    x_ticks = buy_x_positions + sell_x_positions
+    x_labels = [f'${price:.2f}' for price in buy_prices + sell_prices]
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=8)
+
+    ax.set_xlabel('Order Price ($)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Average Price ($)', fontsize=12, fontweight='bold')
+    ax.set_title(
+        'Combined Buy/Sell Ladder: Average Price vs Order Price\n(Point size = Order Quantity)',
+        fontsize=14,
+        fontweight='bold',
+        pad=20
+    )
+
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=0)
+    ax.legend(loc='upper left', fontsize=10, framealpha=0.9, edgecolor='gray', fancybox=True)
+
+    min_qty_formatted = f"{min_qty:.2f}" if min_qty < 1000 else f"{min_qty:.0f}"
+    max_qty_formatted = f"{max_qty:.2f}" if max_qty < 1000 else f"{max_qty:.0f}"
+    size_info = f"Point size scale:\nMin: {min_qty_formatted}\nMax: {max_qty_formatted}"
+    ax.text(
+        0.02,
+        0.98,
+        size_info,
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment='top',
+        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    )
+
+    ax.text(
+        0.02,
+        0.02,
+        'BUY ORDERS',
+        transform=ax.transAxes,
+        fontsize=11,
+        fontweight='bold',
+        color='#2E7D32',
+        bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7)
+    )
+    ax.text(
+        0.98,
+        0.02,
+        'SELL ORDERS',
+        transform=ax.transAxes,
+        fontsize=11,
+        fontweight='bold',
+        color='#C62828',
+        bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7),
+        ha='right'
+    )
+
+    plt.tight_layout()
+    return fig
+
+
 def generate_pdf(results: Dict, filename: str):
     """Generate PDF file with order ladder, statistics, and graphs."""
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    buy_config = OrderSideConfig(
+        side='buy',
+        order_label='Buy order',
+        price_key='buy_prices',
+        quantity_key='buy_quantities',
+        cumulative_key='cumulative_buy_cost',
+        average_key='avg_buy_prices',
+        table_title='Buy Orders',
+        chart_title='Buy Ladder: Price and Quantity by Order Rung',
+        individual_label='Individual Buy Price',
+        average_label='Average Buy Price',
+        xlabel='Buy Order',
+        column_labels=['Buy Price', 'Quantity', 'Cost', 'Cumulative Cost', 'Avg Buy Price'],
+        price_line_color='#1B5E20',
+        average_line_color='#2E7D32',
+        price_axis_color='#2E7D32',
+        price_annotation_color='#1B5E20',
+        quantity_line_color='#66BB6A',
+        quantity_area_color='#81C784',
+        quantity_axis_color='#66BB6A',
+        quantity_annotation_color='#66BB6A',
+        reverse_for_display=True
+    )
+
+    sell_config = OrderSideConfig(
+        side='sell',
+        order_label='Sell order',
+        price_key='sell_prices',
+        quantity_key='sell_quantities',
+        cumulative_key='cumulative_sell_revenue',
+        average_key='avg_sell_prices',
+        table_title='Sell Orders',
+        chart_title='Sell Ladder: Price and Quantity by Order Rung',
+        individual_label='Individual Sell Price',
+        average_label='Average Sell Price',
+        xlabel='Sell Order',
+        column_labels=['Sell Price', 'Quantity', 'Revenue', 'Cumulative Revenue', 'Avg Sell Price'],
+        price_line_color='#B71C1C',
+        average_line_color='#C62828',
+        price_axis_color='#C62828',
+        price_annotation_color='#B71C1C',
+        quantity_line_color='#E53935',
+        quantity_area_color='#EF5350',
+        quantity_axis_color='#E53935',
+        quantity_annotation_color='#E53935'
+    )
+
     with PdfPages(filename) as pdf:
-        # Create figure for summary and orders
-        fig = plt.figure(figsize=(11, 8.5))
-        fig.text(0.5, 0.95, 'Staggered Order Ladder', 
-                ha='center', fontsize=16, fontweight='bold')
-        
-        # Summary text
-        summary_text = f"""
-Summary:
-  Total Budget: ${results['budget']:,.2f}
-  Number of Rungs: {results['num_rungs']}
-  Total Cost: ${results['total_cost']:,.2f}
-  Total Revenue: ${results['total_revenue']:,.2f}
-  Total Profit: ${results['total_profit']:,.2f}
-  Profit Percentage: {results['profit_pct']:.2f}%
-        """
-        
-        fig.text(0.1, 0.85, summary_text, fontsize=10, family='monospace',
-                verticalalignment='top')
-        
-        # Create table for buy orders
-        ax1 = fig.add_subplot(211)
-        ax1.axis('tight')
-        ax1.axis('off')
-        
-        buy_data = []
-        # Reverse order: Buy order 1 = highest price, Buy order 10 = lowest price
-        buy_prices_reversed = list(reversed(results['buy_prices']))
-        buy_quantities_reversed = list(reversed(results['buy_quantities']))
-        cumulative_buy_cost_reversed = list(reversed(results['cumulative_buy_cost']))
-        avg_buy_prices_reversed = list(reversed(results['avg_buy_prices']))
-        
-        for i in range(results['num_rungs']):
-            buy_data.append([
-                f"${buy_prices_reversed[i]:,.2f}",
-                f"{buy_quantities_reversed[i]:,.4f}",
-                f"${buy_prices_reversed[i] * buy_quantities_reversed[i]:,.2f}",
-                f"${cumulative_buy_cost_reversed[i]:,.2f}",
-                f"${avg_buy_prices_reversed[i]:,.2f}"
-            ])
-        
-        buy_table = ax1.table(cellText=buy_data,
-                              colLabels=['Buy Price', 'Quantity', 'Cost', 
-                                        'Cumulative Cost', 'Avg Buy Price'],
-                              cellLoc='center',
-                              loc='center')
-        buy_table.auto_set_font_size(False)
-        buy_table.set_fontsize(8)
-        buy_table.scale(1, 1.5)
-        ax1.set_title('Buy Orders', fontweight='bold', pad=20)
-        
-        # Create table for sell orders
-        ax2 = fig.add_subplot(212)
-        ax2.axis('tight')
-        ax2.axis('off')
-        
-        sell_data = []
-        for i in range(results['num_rungs']):
-            sell_data.append([
-                f"${results['sell_prices'][i]:,.2f}",
-                f"{results['sell_quantities'][i]:,.4f}",
-                f"${results['sell_prices'][i] * results['sell_quantities'][i]:,.2f}",
-                f"${results['cumulative_sell_revenue'][i]:,.2f}",
-                f"${results['avg_sell_prices'][i]:,.2f}"
-            ])
-        
-        sell_table = ax2.table(cellText=sell_data,
-                              colLabels=['Sell Price', 'Quantity', 'Revenue',
-                                        'Cumulative Revenue', 'Avg Sell Price'],
-                              cellLoc='center',
-                              loc='center')
-        sell_table.auto_set_font_size(False)
-        sell_table.set_fontsize(8)
-        sell_table.scale(1, 1.5)
-        ax2.set_title('Sell Orders', fontweight='bold', pad=20)
-        
-        plt.tight_layout()
-        pdf.savefig(fig, bbox_inches='tight')
-        plt.close()
-        
-        # Graph: Buy price and quantity as price levels fill
-        fig, ax1 = plt.subplots(figsize=(11, 8.5))
-        # Reverse order: Buy order 1 = highest price, Buy order 10 = lowest price
-        buy_price_levels = list(reversed(results['buy_prices']))  # Reverse: highest to lowest
-        buy_quantities = list(reversed(results['buy_quantities']))
-        avg_buy_prices = list(reversed(results['avg_buy_prices']))
-        
-        # Plot with highest price (Buy order 1) on left, lowest price (Buy order 10) on right
-        x_positions = list(range(len(buy_price_levels)))
-        
-        # Create second y-axis for quantity (right side) - create early for area chart
-        ax2 = ax1.twinx()
-        
-        # Plot quantity as area chart (less competing with lines, more subtle)
-        ax2.fill_between(x_positions, 0, buy_quantities, alpha=0.2, color='#81C784', 
-                        label='Quantity', step='mid')
-        # Add subtle line on top of area for clarity
-        ax2.plot(x_positions, buy_quantities, marker='^', markersize=5, 
-                linewidth=1.5, color='#66BB6A', linestyle=':', alpha=0.7)
-        ax2.set_ylabel('Quantity', fontsize=12, fontweight='bold', color='#66BB6A')
-        ax2.tick_params(axis='y', labelcolor='#66BB6A')
-        
-        # Plot individual buy prices on left y-axis (ax1) - make more prominent
-        line1 = ax1.plot(x_positions, buy_price_levels, marker='o', linewidth=2.5, 
-                markersize=9, color='#1B5E20', label='Individual Buy Price', 
-                linestyle='-', zorder=3)
-        line2 = ax1.plot(x_positions, avg_buy_prices, marker='s', linewidth=2.5, 
-                markersize=7, color='#2E7D32', label='Average Buy Price', 
-                linestyle='--', zorder=3)
-        ax1.set_ylabel('Price ($)', fontsize=12, fontweight='bold', color='#2E7D32')
-        ax1.tick_params(axis='y', labelcolor='#2E7D32')
-        ax1.set_title('Buy Ladder: Price and Quantity by Order Rung', fontsize=14, fontweight='bold')
-        ax1.grid(True, alpha=0.3, axis='both', linestyle='--', linewidth=0.5)
-        
-        # Add value labels on price points (every other point to avoid clutter)
-        for i in range(0, len(x_positions), 2):
-            ax1.annotate(f'${buy_price_levels[i]:.0f}', 
-                        xy=(x_positions[i], buy_price_levels[i]),
-                        xytext=(0, 10), textcoords='offset points',
-                        fontsize=8, ha='center', color='#1B5E20', alpha=0.7)
-        
-        # Add quantity value labels on peaks (top 3 quantities)
-        sorted_indices = sorted(range(len(buy_quantities)), 
-                               key=lambda i: buy_quantities[i], reverse=True)[:3]
-        for i in sorted_indices:
-            ax2.annotate(f'{buy_quantities[i]:.1f}', 
-                        xy=(x_positions[i], buy_quantities[i]),
-                        xytext=(0, 5), textcoords='offset points',
-                        fontsize=8, ha='center', color='#66BB6A', 
-                        fontweight='bold', alpha=0.8)
-        
-        # Set x-axis labels to show buy orders (1 = highest price, 10 = lowest price)
-        ax1.set_xticks(x_positions)
-        ax1.set_xticklabels([f'Buy order {i+1}' for i in range(len(buy_price_levels))], 
-                           rotation=0, ha='center', fontsize=10)
-        ax1.set_xlabel('Buy Order', fontsize=12, fontweight='bold')
-        
-        # Combine legends with better positioning
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=10,
-                  framealpha=0.9, edgecolor='gray', fancybox=True)
-        
-        plt.tight_layout()
-        pdf.savefig(fig, bbox_inches='tight')
-        plt.close()
-        
-        # Graph: Sell price and quantity as price levels fill
-        fig, ax1 = plt.subplots(figsize=(11, 8.5))
-        sell_price_levels = results['sell_prices']  # Already in ascending order (lowest to highest)
-        sell_quantities = results['sell_quantities']
-        avg_sell_prices = results['avg_sell_prices']  # Cumulative averages as orders fill
-        
-        # Plot in ascending order: lowest price on left, highest on right
-        # This shows how average price increases as you fill orders from lowest to highest
-        x_positions = list(range(len(sell_price_levels)))
-        
-        # Create second y-axis for quantity (right side) - create early for area chart
-        ax2 = ax1.twinx()
-        
-        # Plot quantity as area chart (less competing with lines, more subtle)
-        ax2.fill_between(x_positions, 0, sell_quantities, alpha=0.2, color='#EF5350', 
-                        label='Quantity', step='mid')
-        # Add subtle line on top of area for clarity
-        ax2.plot(x_positions, sell_quantities, marker='^', markersize=5, 
-                linewidth=1.5, color='#E53935', linestyle=':', alpha=0.7)
-        ax2.set_ylabel('Quantity', fontsize=12, fontweight='bold', color='#E53935')
-        ax2.tick_params(axis='y', labelcolor='#E53935')
-        
-        # Plot individual sell prices on left y-axis (ax1) - make more prominent
-        line1 = ax1.plot(x_positions, sell_price_levels, marker='o', linewidth=2.5, 
-                markersize=9, color='#B71C1C', label='Individual Sell Price', 
-                linestyle='-', zorder=3)
-        line2 = ax1.plot(x_positions, avg_sell_prices, marker='s', linewidth=2.5, 
-                markersize=7, color='#C62828', label='Average Sell Price', 
-                linestyle='--', zorder=3)
-        ax1.set_ylabel('Price ($)', fontsize=12, fontweight='bold', color='#C62828')
-        ax1.tick_params(axis='y', labelcolor='#C62828')
-        ax1.set_title('Sell Ladder: Price and Quantity by Order Rung', fontsize=14, fontweight='bold')
-        ax1.grid(True, alpha=0.3, axis='both', linestyle='--', linewidth=0.5)
-        
-        # Add value labels on price points (every other point to avoid clutter)
-        for i in range(0, len(x_positions), 2):
-            ax1.annotate(f'${sell_price_levels[i]:.0f}', 
-                        xy=(x_positions[i], sell_price_levels[i]),
-                        xytext=(0, 10), textcoords='offset points',
-                        fontsize=8, ha='center', color='#B71C1C', alpha=0.7)
-        
-        # Add quantity value labels on peaks (top 3 quantities)
-        sorted_indices = sorted(range(len(sell_quantities)), 
-                               key=lambda i: sell_quantities[i], reverse=True)[:3]
-        for i in sorted_indices:
-            ax2.annotate(f'{sell_quantities[i]:.1f}', 
-                        xy=(x_positions[i], sell_quantities[i]),
-                        xytext=(0, 5), textcoords='offset points',
-                        fontsize=8, ha='center', color='#E53935', 
-                        fontweight='bold', alpha=0.8)
-        
-        # Set x-axis labels to show sell orders
-        ax1.set_xticks(x_positions)
-        ax1.set_xticklabels([f'Sell order {i+1}' for i in range(len(sell_price_levels))], 
-                           rotation=0, ha='center', fontsize=10)
-        ax1.set_xlabel('Sell Order', fontsize=12, fontweight='bold')
-        
-        # Combine legends with better positioning
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=10,
-                  framealpha=0.9, edgecolor='gray', fancybox=True)
-        
-        plt.tight_layout()
-        pdf.savefig(fig, bbox_inches='tight')
-        plt.close()
-        
-        # Combined graph: Buy orders on left, Sell orders on right
-        # X-axis: Price (buy prices negative, sell prices positive)
-        # Y-axis: Average price
-        # Point size: Quantity
-        fig, ax = plt.subplots(figsize=(11, 8.5))
-        
-        # Prepare buy order data
-        # buy_prices is in ascending order (lowest to highest)
-        # buy_prices[0] = lowest price (executes LAST when price drops)
-        # buy_prices[-1] = highest price (executes FIRST when price drops)
-        # avg_buy_prices[0] = average when price drops to lowest price (ALL orders have executed)
-        # avg_buy_prices[-1] = average when price drops to highest price (only highest order executed)
-        buy_prices = results['buy_prices']  # Ascending order: [lowest, ..., highest]
-        buy_quantities = results['buy_quantities']
-        avg_buy_prices = results['avg_buy_prices']
-        
-        # Verify highest buy average equals highest buy price (only that order has executed)
-        if len(buy_prices) > 0 and len(avg_buy_prices) > 0:
-            highest_index = len(buy_prices) - 1
-            if abs(avg_buy_prices[highest_index] - buy_prices[highest_index]) > 0.01:
-                logger.warning(f"Graph: Highest buy average {avg_buy_prices[highest_index]:.2f} != highest buy price {buy_prices[highest_index]:.2f}")
-                # Don't force correction - let the calculated value stand
-        
-        # Prepare sell order data
-        # sell_prices[0] = lowest price (executes first)
-        # avg_sell_prices[0] = average after first order executes = sell_prices[0]
-        sell_prices = results['sell_prices']  # Already in ascending order (lowest to highest)
-        sell_quantities = results['sell_quantities']
-        avg_sell_prices = results['avg_sell_prices']
-        
-        # Verify first sell average equals first sell price
-        if len(sell_prices) > 0 and len(avg_sell_prices) > 0:
-            if abs(avg_sell_prices[0] - sell_prices[0]) > 0.01:
-                logger.warning(f"Graph: First sell average {avg_sell_prices[0]:.2f} != first sell price {sell_prices[0]:.2f}, correcting...")
-                avg_sell_prices = list(avg_sell_prices)  # Make a copy to modify
-                avg_sell_prices[0] = sell_prices[0]
-        
-        # Normalize quantities for point sizing (scale to reasonable size range)
-        all_quantities = buy_quantities + sell_quantities
-        min_qty = min(all_quantities)
-        max_qty = max(all_quantities)
-        qty_range = max_qty - min_qty if max_qty > min_qty else 1
-        
-        # Scale point sizes: min_size to max_size based on quantity
-        min_point_size = 50
-        max_point_size = 500
-        def scale_size(qty):
-            if qty_range == 0:
-                return (min_point_size + max_point_size) / 2
-            normalized = (qty - min_qty) / qty_range
-            return min_point_size + normalized * (max_point_size - min_point_size)
-        
-        buy_point_sizes = [scale_size(qty) for qty in buy_quantities]
-        sell_point_sizes = [scale_size(qty) for qty in sell_quantities]
-        
-        # Calculate x-axis positions based on actual prices
-        # Use actual price values scaled so buys are on left (negative) and sells on right (positive)
-        min_buy_price = min(buy_prices)
-        max_buy_price = max(buy_prices)
-        min_sell_price = min(sell_prices)
-        max_sell_price = max(sell_prices)
-        
-        # Find the midpoint between max buy and min sell to use as the y-axis (x=0) separator
-        price_midpoint = (max_buy_price + min_sell_price) / 2
-        
-        # Scale prices so they're positioned relative to the midpoint
-        # Buy prices become negative (left of y-axis), sell prices become positive (right of y-axis)
-        # This maintains the actual price spacing while separating buys and sells
-        buy_x_positions = [price - price_midpoint for price in buy_prices]
-        sell_x_positions = [price - price_midpoint for price in sell_prices]
-        
-        # Calculate volumes (quantity * price) for each order
-        buy_volumes = [qty * price for qty, price in zip(buy_quantities, buy_prices)]
-        sell_volumes = [qty * price for qty, price in zip(sell_quantities, sell_prices)]
-        
-        # Get y-axis limits for price to position volume bars at bottom
-        y_min_price = min(min(avg_buy_prices), min(avg_sell_prices))
-        y_max_price = max(max(avg_buy_prices), max(avg_sell_prices))
-        y_range_price = y_max_price - y_min_price
-        
-        # Calculate bar width based on x-axis spacing
-        if len(buy_x_positions) > 1:
-            buy_bar_width = (buy_x_positions[1] - buy_x_positions[0]) * 0.8
-        else:
-            buy_bar_width = abs(buy_x_positions[0]) * 0.1 if buy_x_positions else 1
-        
-        if len(sell_x_positions) > 1:
-            sell_bar_width = (sell_x_positions[1] - sell_x_positions[0]) * 0.8
-        else:
-            sell_bar_width = sell_x_positions[0] * 0.1 if sell_x_positions else 1
-        
-        # Normalize volumes to fit in bottom portion of graph (bottom 20% of y-axis)
-        all_volumes = buy_volumes + sell_volumes
-        max_volume = max(all_volumes) if all_volumes else 1
-        volume_bar_height = y_range_price * 0.15  # Use 15% of y-axis range for volume bars
-        volume_scale = volume_bar_height / max_volume if max_volume > 0 else 1
-        
-        # Position volume bars at bottom of graph
-        volume_bottom = y_min_price - y_range_price * 0.05  # Position slightly below minimum price
-        
-        # Plot volume bars for buy orders
-        buy_volume_heights = [vol * volume_scale for vol in buy_volumes]
-        ax.bar(buy_x_positions, buy_volume_heights, width=buy_bar_width,
-               bottom=volume_bottom, alpha=0.5, color='#81C784', 
-               edgecolor='#2E7D32', linewidth=1, label='Buy Volume', zorder=2)
-        
-        # Plot volume bars for sell orders
-        sell_volume_heights = [vol * volume_scale for vol in sell_volumes]
-        ax.bar(sell_x_positions, sell_volume_heights, width=sell_bar_width,
-               bottom=volume_bottom, alpha=0.5, color='#EF5350', 
-               edgecolor='#C62828', linewidth=1, label='Sell Volume', zorder=2)
-        
-        # Plot buy orders on left side
-        ax.scatter(buy_x_positions, avg_buy_prices, s=buy_point_sizes, 
-                  alpha=0.6, color='#2E7D32', edgecolors='#1B5E20', 
-                  linewidths=1.5, label='Buy Orders', zorder=3)
-        
-        # Plot sell orders on right side
-        ax.scatter(sell_x_positions, avg_sell_prices, s=sell_point_sizes, 
-                  alpha=0.6, color='#C62828', edgecolors='#B71C1C', 
-                  linewidths=1.5, label='Sell Orders', zorder=3)
-        
-        # Add vertical line at x=0 (y-axis) to separate buy and sell sides
-        ax.axvline(x=0, color='gray', linestyle='--', linewidth=2, alpha=0.7, zorder=1)
-        
-        # Set x-axis limits
-        all_x_positions = buy_x_positions + sell_x_positions
-        x_min = min(all_x_positions)
-        x_max = max(all_x_positions)
-        x_range = x_max - x_min
-        x_padding = x_range * 0.05
-        ax.set_xlim(x_min - x_padding, x_max + x_padding)
-        
-        # Adjust y-axis limits to include volume bars
-        max_volume_bar_height = max(max(buy_volume_heights) if buy_volume_heights else 0,
-                                   max(sell_volume_heights) if sell_volume_heights else 0)
-        # Top of tallest volume bar
-        volume_bar_top = volume_bottom + max_volume_bar_height
-        # Ensure y-axis includes both price range and volume bars
-        y_min_with_volume = min(volume_bottom, y_min_price) - y_range_price * 0.02
-        y_max_with_volume = max(volume_bar_top, y_max_price) + y_range_price * 0.02
-        ax.set_ylim(y_min_with_volume, y_max_with_volume)
-        
-        # Format x-axis labels to show actual price values
-        x_ticks = []
-        x_labels = []
-        
-        # Add buy price ticks (show actual prices)
-        for i, price in enumerate(buy_prices):
-            x_ticks.append(buy_x_positions[i])
-            x_labels.append(f'${price:.2f}')
-        
-        # Add sell price ticks (show actual prices)
-        for i, price in enumerate(sell_prices):
-            x_ticks.append(sell_x_positions[i])
-            x_labels.append(f'${price:.2f}')
-        
-        ax.set_xticks(x_ticks)
-        ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=8)
-        
-        # Set labels and title
-        ax.set_xlabel('Order Price ($)', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Average Price ($)', fontsize=12, fontweight='bold')
-        ax.set_title('Combined Buy/Sell Ladder: Average Price vs Order Price\n(Point size = Order Quantity)', 
-                    fontsize=14, fontweight='bold', pad=20)
-        
-        # Add grid
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=0)
-        
-        # Add legend with quantity scale information
-        legend = ax.legend(loc='upper left', fontsize=10, framealpha=0.9, 
-                          edgecolor='gray', fancybox=True)
-        
-        # Add text annotation explaining point sizes
-        min_qty_formatted = f"{min_qty:.2f}" if min_qty < 1000 else f"{min_qty:.0f}"
-        max_qty_formatted = f"{max_qty:.2f}" if max_qty < 1000 else f"{max_qty:.0f}"
-        size_info = f"Point size scale:\nMin: {min_qty_formatted}\nMax: {max_qty_formatted}"
-        ax.text(0.02, 0.98, size_info, transform=ax.transAxes, 
-               fontsize=9, verticalalignment='top', 
-               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
-        # Add labels for buy and sell sides
-        ax.text(0.02, 0.02, 'BUY ORDERS', transform=ax.transAxes, 
-               fontsize=11, fontweight='bold', color='#2E7D32',
-               bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7))
-        ax.text(0.98, 0.02, 'SELL ORDERS', transform=ax.transAxes, 
-               fontsize=11, fontweight='bold', color='#C62828',
-               bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7),
-               ha='right')
-        
-        plt.tight_layout()
-        pdf.savefig(fig, bbox_inches='tight')
-        plt.close()
+        summary_fig = _create_summary_figure(results, (buy_config, sell_config))
+        pdf.savefig(summary_fig, bbox_inches='tight')
+        plt.close(summary_fig)
+
+        for config in (buy_config, sell_config):
+            fig = _create_order_graph_figure(results, config)
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+
+        combined_fig = _create_combined_ladder_figure(results)
+        pdf.savefig(combined_fig, bbox_inches='tight')
+        plt.close(combined_fig)
     
     logger.info(f"PDF file saved: {filename}")
 

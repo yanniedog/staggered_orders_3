@@ -16,3 +16,4 @@ data class CalculationResult(
     val totalSellQuantity: Double
 )
 
+

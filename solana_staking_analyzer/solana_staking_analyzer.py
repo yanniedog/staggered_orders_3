@@ -12,13 +12,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import socket
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import httpx
 import pandas as pd
@@ -27,6 +28,16 @@ from solders.pubkey import Pubkey
 
 LAMPORTS_PER_SOL = 1_000_000_000
 STAKE_PROGRAM_ID = "Stake11111111111111111111111111111111111111"
+STAKE_INSTRUCTION_KEYWORDS = {
+    "initialize",
+    "delegate",
+    "authorize",
+    "authorizewithseed",
+    "deactivate",
+    "withdraw",
+    "split",
+    "merge",
+}
 MAX_RPC_RETRIES = 8
 MAX_ENDPOINT_FAILURES = 3
 RETRY_BACKOFF_SECONDS = 1.0
@@ -35,6 +46,69 @@ RETRY_BACKOFF_JITTER = 0.25
 RATE_LIMIT_STATUS_CODES = {429}
 CONFIG_FILENAME = "config.cfg"
 ENDPOINT_ROTATION_STATUS_CODES = {429, 503}
+SOLSCAN_API_BASE = "https://pro-api.solscan.io/v2.0"
+SOLSCAN_DEFAULT_PAGE_SIZE = 100
+SOLSCAN_MAX_RETRIES = 6
+SOLSCAN_RATE_LIMIT_STATUS_CODES = {429}
+SOLSCAN_RETRY_BACKOFF_SECONDS = 0.75
+SOLSCAN_MAX_RETRY_BACKOFF_SECONDS = 8.0
+SOLSCAN_RETRY_BACKOFF_JITTER = 0.2
+
+
+def try_extract_stake_accounts_from_instruction(instruction: Dict[str, Any]) -> List[str]:
+    if not isinstance(instruction, dict):
+        return []
+
+    candidates: Set[str] = set()
+    name = (
+        instruction.get("name")
+        or instruction.get("instruction_name")
+        or instruction.get("type")
+        or ""
+    )
+    name_lower = str(name).lower()
+    if not any(keyword in name_lower for keyword in STAKE_INSTRUCTION_KEYWORDS):
+        # Continue examining accounts even if the instruction label is unfamiliar.
+        pass
+
+    params = instruction.get("params")
+    if isinstance(params, dict):
+        for key in ("stakeAccount", "stake_account", "stake", "account", "source", "destination"):
+            value = params.get(key)
+            if isinstance(value, str) and len(value) >= 32:
+                candidates.add(value)
+
+    for key in ("stakeAccount", "stake_account", "stake", "account"):
+        value = instruction.get(key)
+        if isinstance(value, str) and len(value) >= 32:
+            candidates.add(value)
+
+    accounts_field = instruction.get("accounts") or instruction.get("account_keys") or []
+    if isinstance(accounts_field, list):
+        for entry in accounts_field:
+            if isinstance(entry, dict):
+                role = str(entry.get("name") or entry.get("role") or "").lower()
+                pubkey = entry.get("pubkey") or entry.get("address") or entry.get("pubKey")
+                if isinstance(pubkey, str) and len(pubkey) >= 32:
+                    if not role or "stake" in role or role in {"stakeaccount", "stake_account"}:
+                        candidates.add(pubkey)
+            elif isinstance(entry, str) and len(entry) >= 32:
+                candidates.add(entry)
+
+    return list(candidates)
+
+
+DEFAULT_PRIMARY_RPC_ENDPOINTS: Sequence[str] = (
+    "https://api.mainnet-beta.solana.com",
+    "https://ssc-dao.genesysgo.net",
+)
+DEFAULT_SECONDARY_RPC_ENDPOINTS: Sequence[str] = (
+    "https://solana-api.projectserum.com",
+    "https://rpc.ankr.com/solana",
+)
+DEFAULT_TERTIARY_RPC_ENDPOINTS: Sequence[str] = (
+    "https://solana.public-rpc.com",
+)
 
 
 class ConfigurationError(RuntimeError):
@@ -94,6 +168,7 @@ class RewardRecord:
     post_balance_lamports: int
     effective_slot: Optional[int]
     commission: Optional[int]
+    block_time: Optional[int] = None
 
     @property
     def amount_sol(self) -> float:
@@ -128,6 +203,9 @@ class StakeAccount:
     validator_delinquent: Optional[bool] = None
     delegation_history: List["DelegationEvent"] = field(default_factory=list)
     historical_validators: List[str] = field(default_factory=list)
+    first_seen_unix: Optional[int] = None
+    last_seen_unix: Optional[int] = None
+    history_signature_count: int = 0
 
     @property
     def delegated_sol(self) -> float:
@@ -139,10 +217,33 @@ class StakeAccount:
 
 
 class SolanaRPCClient:
-    def __init__(self, endpoints: List[str], concurrency_limit: int, timeout: float = 35.0) -> None:
-        if not endpoints:
+    def __init__(
+        self,
+        endpoint_groups: Sequence[Sequence[str]],
+        concurrency_limit: int,
+        timeout: float = 35.0,
+    ) -> None:
+        if not endpoint_groups:
             raise ConfigurationError("At least one RPC endpoint must be provided")
-        self.endpoints = endpoints
+
+        normalized_groups: List[List[str]] = []
+        for group in endpoint_groups:
+            normalized_group: List[str] = []
+            for endpoint in group:
+                value = endpoint.strip() if isinstance(endpoint, str) else str(endpoint).strip()
+                if not value:
+                    continue
+                if value not in normalized_group:
+                    normalized_group.append(value)
+            if normalized_group:
+                normalized_groups.append(normalized_group)
+
+        if not normalized_groups:
+            raise ConfigurationError("No usable RPC endpoints after normalization")
+
+        self._endpoint_groups = normalized_groups
+        self._group_index = 0
+        self.endpoints = self._endpoint_groups[self._group_index]
         self._current_index = 0
         self._timeout = timeout
         self._client: Optional[httpx.AsyncClient] = None
@@ -179,7 +280,7 @@ class SolanaRPCClient:
             async with self._semaphore:
                 delay: Optional[float] = None
                 try:
-                    endpoint = self.endpoints[self._current_index]
+                    endpoint = self._ensure_active_endpoint()
                     self.logger.info(
                         "RPC Request -> method=%s attempt=%d endpoint=%s payload=%s",
                         method,
@@ -199,7 +300,7 @@ class SolanaRPCClient:
                         summarize_result(data),
                     )
                 except httpx.HTTPStatusError as exc:
-                    endpoint = self.endpoints[self._current_index]
+                    endpoint = self._ensure_active_endpoint()
                     status_code = exc.response.status_code if exc.response is not None else None
                     delay = self._compute_retry_delay(attempt, status_code)
                     if status_code in RATE_LIMIT_STATUS_CODES:
@@ -223,7 +324,7 @@ class SolanaRPCClient:
                     if attempt >= MAX_RPC_RETRIES:
                         raise RPCError(f"HTTP error on method {method}: {exc}") from exc
                 except httpx.RequestError as exc:
-                    endpoint = self.endpoints[self._current_index]
+                    endpoint = self._ensure_active_endpoint()
                     self.logger.warning("Request error on %s attempt %d via %s: %s", method, attempt, endpoint, exc)
                     self._mark_endpoint_unhealthy(endpoint, 30.0)
                     fatal = isinstance(getattr(exc, "__cause__", None), socket.gaierror)
@@ -243,7 +344,7 @@ class SolanaRPCClient:
                         self.logger.warning("RPC error on %s attempt %d: %s", method, attempt, message)
                         lower_message = message.lower()
                         if "cleaned up" in lower_message or "does not exist on node" in lower_message:
-                            endpoint = self.endpoints[self._current_index]
+                            endpoint = self._ensure_active_endpoint()
                             self._mark_endpoint_unhealthy(endpoint, 60.0)
                             self._record_endpoint_failure(endpoint)
                             rotated = self._rotate_endpoint()
@@ -272,9 +373,20 @@ class SolanaRPCClient:
         self._request_id += 1
         return self._request_id
 
+    def _ensure_active_endpoint(self) -> str:
+        if not self.endpoints:
+            if not self._promote_group():
+                raise RPCError("All RPC endpoints exhausted")
+        if self._current_index >= len(self.endpoints):
+            self._current_index = 0
+        if not self.endpoints:
+            raise RPCError("All RPC endpoints exhausted")
+        return self.endpoints[self._current_index]
+
     def _rotate_endpoint(self) -> Optional[str]:
-        if len(self.endpoints) == 1:
-            return None
+        if not self.endpoints:
+            promoted = self._promote_group()
+            return self.endpoints[self._current_index] if promoted and self.endpoints else None
         self._cleanup_unhealthy()
         starting_index = self._current_index
         for _ in range(len(self.endpoints)):
@@ -285,7 +397,22 @@ class SolanaRPCClient:
                 continue
             return endpoint
         self._current_index = starting_index
-        return None
+        promoted = self._promote_group()
+        return self.endpoints[self._current_index] if promoted and self.endpoints else None
+
+    def _promote_group(self) -> bool:
+        if self._group_index + 1 >= len(self._endpoint_groups):
+            self.logger.error("No additional RPC endpoint groups available")
+            return False
+        self._group_index += 1
+        self.endpoints = self._endpoint_groups[self._group_index]
+        self._current_index = 0
+        self.logger.warning(
+            "Promoting to fallback RPC endpoint group %d (%d endpoints)",
+            self._group_index + 1,
+            len(self.endpoints),
+        )
+        return bool(self.endpoints)
 
     def _mark_endpoint_unhealthy(self, endpoint: str, duration: float) -> None:
         self._unhealthy[endpoint] = time.monotonic() + max(duration, 1.0)
@@ -296,25 +423,32 @@ class SolanaRPCClient:
         for endpoint in expired:
             self._unhealthy.pop(endpoint, None)
 
-    def _record_endpoint_failure(self, endpoint: str, fatal: bool = False) -> None:
+    def _record_endpoint_failure(self, endpoint: Optional[str], fatal: bool = False) -> None:
+        if not endpoint:
+            return
         count = self._endpoint_failures.get(endpoint, 0) + 1
         self._endpoint_failures[endpoint] = count
         if fatal or count >= MAX_ENDPOINT_FAILURES:
-            if len(self.endpoints) <= 1:
-                return
-            try:
-                index = self.endpoints.index(endpoint)
-            except ValueError:
+            if endpoint in self.endpoints:
+                try:
+                    index = self.endpoints.index(endpoint)
+                except ValueError:
+                    self._endpoint_failures.pop(endpoint, None)
+                    return
+                self.logger.error(
+                    "Removing RPC endpoint %s after %d consecutive failures", endpoint, count
+                )
+                self.endpoints.pop(index)
+                self._unhealthy.pop(endpoint, None)
                 self._endpoint_failures.pop(endpoint, None)
-                return
-            self.logger.error(
-                "Removing RPC endpoint %s after %d consecutive failures", endpoint, count
-            )
-            self.endpoints.pop(index)
-            self._unhealthy.pop(endpoint, None)
-            self._endpoint_failures.pop(endpoint, None)
-            if self._current_index >= len(self.endpoints):
-                self._current_index = 0
+                if not self.endpoints:
+                    promoted = self._promote_group()
+                    if not promoted:
+                        self.logger.error("All RPC endpoint groups exhausted after removing %s", endpoint)
+                elif self._current_index >= len(self.endpoints):
+                    self._current_index = 0
+            else:
+                self._endpoint_failures.pop(endpoint, None)
 
     def _compute_retry_delay(self, attempt: int, status_code: Optional[int]) -> float:
         base = RETRY_BACKOFF_SECONDS
@@ -324,6 +458,102 @@ class SolanaRPCClient:
             backoff = base * attempt
         delay = min(backoff, MAX_RETRY_BACKOFF_SECONDS)
         jitter = random.uniform(0.0, RETRY_BACKOFF_JITTER)
+        return delay + jitter
+
+
+class SolscanClient:
+    def __init__(
+        self,
+        api_key: Optional[str],
+        concurrency_limit: int,
+        base_url: str = SOLSCAN_API_BASE,
+        timeout: float = 30.0,
+    ) -> None:
+        self._api_key = api_key
+        self._headers = {"accept": "application/json"}
+        if api_key:
+            self._headers["token"] = api_key
+        self._client: Optional[httpx.AsyncClient] = None
+        self._semaphore = asyncio.Semaphore(max(1, concurrency_limit))
+        self._timeout = timeout
+        self._base_url = base_url.rstrip("/") or SOLSCAN_API_BASE
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    async def __aenter__(self) -> "SolscanClient":
+        self._client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if self._client is None:
+            raise RuntimeError("Solscan client not initialized; use async context manager")
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        attempt = 0
+        while True:
+            attempt += 1
+            async with self._semaphore:
+                try:
+                    response = await self._client.get(normalized_path, params=params, headers=self._headers)
+                    if response.status_code in SOLSCAN_RATE_LIMIT_STATUS_CODES:
+                        raise httpx.HTTPStatusError("rate limited", request=response.request, response=response)
+                    response.raise_for_status()
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        return payload
+                    return {"data": payload}
+                except httpx.HTTPStatusError as exc:
+                    delay = self._compute_retry_delay(attempt)
+                    status_code = exc.response.status_code if exc.response else None
+                    self.logger.warning(
+                        "Solscan HTTP error on %s attempt=%d status=%s params=%s", normalized_path, attempt, status_code, params
+                    )
+                    if attempt >= SOLSCAN_MAX_RETRIES:
+                        raise
+                    await asyncio.sleep(delay)
+                except httpx.RequestError as exc:
+                    delay = self._compute_retry_delay(attempt)
+                    self.logger.warning(
+                        "Solscan request error on %s attempt=%d params=%s error=%s",
+                        normalized_path,
+                        attempt,
+                        params,
+                        exc,
+                    )
+                    if attempt >= SOLSCAN_MAX_RETRIES:
+                        raise
+                    await asyncio.sleep(delay)
+
+    async def paginate(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        data_key: str = "data",
+        page_size: int = SOLSCAN_DEFAULT_PAGE_SIZE,
+    ) -> List[Any]:
+        results: List[Any] = []
+        page = 1
+        params = dict(params or {})
+        while True:
+            params.update({"page": page, "page_size": page_size})
+            payload = await self.get(path, params=params)
+            data = payload.get(data_key) if isinstance(payload, dict) else None
+            if not data:
+                break
+            if isinstance(data, list):
+                results.extend(data)
+            else:
+                results.append(data)
+            page += 1
+        return results
+
+    def _compute_retry_delay(self, attempt: int) -> float:
+        backoff = SOLSCAN_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+        delay = min(backoff, SOLSCAN_MAX_RETRY_BACKOFF_SECONDS)
+        jitter = random.uniform(0.0, SOLSCAN_RETRY_BACKOFF_JITTER)
         return delay + jitter
 
 
@@ -357,27 +587,81 @@ def load_config(config_path: Path, wallet_config_path: Optional[Path] = None) ->
         raise ConfigurationError(f"Invalid wallet address: {wallet_address}") from exc
     config["wallet_address"] = wallet_address
 
+    data_source = str(config.get("data_source", "solscan")).strip().lower()
+    if data_source not in {"solscan", "rpc"}:
+        raise ConfigurationError("'data_source' must be either 'solscan' or 'rpc'.")
+    config["data_source"] = data_source
+
+    solscan_api_key = str(config.get("solscan_api_key") or os.getenv("SOLSCAN_API_KEY") or "").strip() or None
+    if solscan_api_key:
+        config["solscan_api_key"] = solscan_api_key
+    solscan_base_url = str(config.get("solscan_base_url") or SOLSCAN_API_BASE).strip().rstrip("/")
+    config["solscan_base_url"] = solscan_base_url or SOLSCAN_API_BASE
+    config["solscan_page_size"] = safe_int(config.get("solscan_page_size")) or SOLSCAN_DEFAULT_PAGE_SIZE
+
     rpc_endpoint = config.get("rpc_endpoint")
     rpc_endpoints = config.get("rpc_endpoints")
-    resolved_endpoints: List[str]
-    if rpc_endpoints and isinstance(rpc_endpoints, list):
-        resolved_endpoints = [str(endpoint).strip() for endpoint in rpc_endpoints if endpoint]
-    elif isinstance(rpc_endpoint, str) and rpc_endpoint:
-        resolved_endpoints = [rpc_endpoint.strip()]
+    fallback_endpoints = config.get("rpc_fallback_endpoints")
+
+    if data_source == "rpc":
+        def _normalize_group(candidates: Optional[Sequence[Any]]) -> List[str]:
+            group: List[str] = []
+            if not candidates:
+                return group
+            for endpoint in candidates:
+                if isinstance(endpoint, str):
+                    value = endpoint.strip()
+                else:
+                    value = str(endpoint).strip()
+                if not value or value in seen_endpoints:
+                    continue
+                group.append(value)
+                seen_endpoints.add(value)
+            return group
+
+        seen_endpoints: set[str] = set()
+        endpoint_groups: List[List[str]] = []
+
+        resolved_user: Sequence[Any]
+        if rpc_endpoints and isinstance(rpc_endpoints, list):
+            resolved_user = rpc_endpoints
+        elif isinstance(rpc_endpoint, str) and rpc_endpoint:
+            resolved_user = [rpc_endpoint]
+        else:
+            resolved_user = []
+
+        user_group = _normalize_group(resolved_user)
+        if user_group:
+            endpoint_groups.append(user_group)
+
+        fallback_group = _normalize_group(fallback_endpoints if isinstance(fallback_endpoints, list) else [])
+        if fallback_group:
+            endpoint_groups.append(fallback_group)
+
+        primary_group = _normalize_group(DEFAULT_PRIMARY_RPC_ENDPOINTS)
+        if primary_group:
+            endpoint_groups.append(primary_group)
+
+        secondary_group = _normalize_group(DEFAULT_SECONDARY_RPC_ENDPOINTS)
+        if secondary_group:
+            endpoint_groups.append(secondary_group)
+
+        tertiary_group = _normalize_group(DEFAULT_TERTIARY_RPC_ENDPOINTS)
+        if tertiary_group:
+            endpoint_groups.append(tertiary_group)
+
+        endpoint_groups = [group for group in endpoint_groups if group]
+        if not endpoint_groups:
+            raise ConfigurationError("No valid RPC endpoints configured or available as fallbacks.")
+
+        flattened_endpoints = [endpoint for group in endpoint_groups for endpoint in group]
+        config["rpc_endpoint_groups"] = endpoint_groups
+        config["rpc_endpoints"] = flattened_endpoints
+        config["rpc_endpoint"] = flattened_endpoints[0]
     else:
-        resolved_endpoints = ["https://api.mainnet-beta.solana.com", "https://ssc-dao.genesysgo.net"]
-    deduped: List[str] = []
-    seen: set[str] = set()
-    for endpoint in resolved_endpoints:
-        if not endpoint or endpoint in seen:
-            continue
-        deduped.append(endpoint)
-        seen.add(endpoint)
-    if not deduped:
-        deduped = ["https://api.mainnet-beta.solana.com"]
-    random.shuffle(deduped)
-    config["rpc_endpoints"] = deduped
-    config["rpc_endpoint"] = deduped[0]
+        config["rpc_endpoint_groups"] = []
+        config["rpc_endpoints"] = []
+        config["rpc_endpoint"] = None
 
     concurrency_limit = safe_int(config.get("concurrency_limit")) or 4
     config["concurrency_limit"] = max(1, concurrency_limit)
@@ -387,6 +671,12 @@ def load_config(config_path: Path, wallet_config_path: Optional[Path] = None) ->
     config.setdefault("csv_output_file", "validator_analysis.csv")
     config.setdefault("stake_accounts_csv_output_file", "stake_account_analysis.csv")
     config.setdefault("max_transaction_signatures", 2000)
+    transaction_signature_limit = safe_int(config.get("max_transaction_signatures"))
+    if "max_stake_signatures" not in config:
+        config["max_stake_signatures"] = transaction_signature_limit or 5000
+    if "max_wallet_signatures" not in config:
+        wallet_default = (transaction_signature_limit or 2000) * 2
+        config["max_wallet_signatures"] = max(wallet_default, 5000)
     config.setdefault("transaction_backoff_seconds", 0.35)
     config.setdefault("log_level", "INFO")
 
@@ -494,22 +784,631 @@ class DelegationEvent:
         }
 
 
+def extract_delegate_events(
+    tx: Dict[str, Any],
+    default_stake_account: Optional[str],
+    signature: str,
+) -> List[DelegationEvent]:
+    events: List[DelegationEvent] = []
+    block_time = safe_int(tx.get("blockTime"))
+    slot = safe_int(tx.get("slot"))
+
+    transaction = tx.get("transaction") or {}
+    message = transaction.get("message") if isinstance(transaction, dict) else {}
+    instructions: List[Dict[str, Any]] = []
+    if isinstance(message, dict):
+        instructions.extend(message.get("instructions") or [])
+
+    meta = tx.get("meta") or {}
+    for inner in meta.get("innerInstructions") or []:
+        instructions.extend(inner.get("instructions") or [])
+
+    for instruction in instructions:
+        parsed = instruction.get("parsed") or {}
+        if not parsed:
+            continue
+        program = instruction.get("program") or instruction.get("programId") or instruction.get("program_id")
+        if program not in {"stake", STAKE_PROGRAM_ID}:
+            continue
+        info = parsed.get("info") or {}
+        instruction_type = parsed.get("type") or instruction.get("type")
+        if instruction_type and "delegate" not in str(instruction_type).lower():
+            continue
+        vote_account = (
+            info.get("voteAccount")
+            or info.get("vote_account")
+            or info.get("votePubkey")
+            or info.get("vote_pubkey")
+        )
+        if not vote_account:
+            continue
+        stake_account = (
+            info.get("stakeAccount")
+            or info.get("stake_account")
+            or info.get("stakePubkey")
+            or info.get("stake_pubkey")
+            or default_stake_account
+        )
+        if not stake_account:
+            continue
+        events.append(
+            DelegationEvent(
+                signature=signature,
+                slot=slot,
+                block_time=block_time,
+                vote_account=vote_account,
+                instruction_type=instruction_type,
+                stake_account=stake_account,
+            )
+        )
+    return events
+
+
+def _extract_string(entry: Dict[str, Any], keys: Sequence[str]) -> Optional[str]:
+    for key in keys:
+        value = entry.get(key)
+        if isinstance(value, str) and len(value) >= 32:
+            return value
+    return None
+
+
+def _update_history_meta(
+    history: Dict[str, Dict[str, Any]],
+    address: str,
+    block_time: Optional[int],
+    signature: str,
+) -> None:
+    meta = history.setdefault(address, {"first_seen": None, "last_seen": None, "seen_in": []})
+    if block_time is not None:
+        first = meta.get("first_seen")
+        last = meta.get("last_seen")
+        meta["first_seen"] = min(first, block_time) if first is not None else block_time
+        meta["last_seen"] = max(last, block_time) if last is not None else block_time
+    seen_in = meta.setdefault("seen_in", [])
+    if signature not in seen_in:
+        seen_in.append(signature)
+
+
+async def solscan_fetch_current_stake_accounts(
+    client: SolscanClient,
+    wallet_address: str,
+    page_size: int,
+    logger: logging.Logger,
+) -> Dict[str, Dict[str, Any]]:
+    params = {"address": wallet_address}
+    records = await client.paginate("/account/stake", params=params, page_size=page_size)
+    result: Dict[str, Dict[str, Any]] = {}
+    for entry in records:
+        if not isinstance(entry, dict):
+            continue
+        address = _extract_string(entry, ("address", "stake_address", "stakeAccount", "stake_account"))
+        if address:
+            result[address] = entry
+    logger.info("Solscan returned %d current stake accounts for %s", len(result), wallet_address)
+    return result
+
+
+async def solscan_fetch_transactions_for_address(
+    client: SolscanClient,
+    address: str,
+    limit: Optional[int],
+    page_size: int,
+    logger: logging.Logger,
+) -> List[Dict[str, Any]]:
+    if limit is not None and limit <= 0:
+        return []
+    collected: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        effective_page_size = page_size
+        if limit is not None:
+            remaining = limit - len(collected)
+            if remaining <= 0:
+                break
+            effective_page_size = min(page_size, remaining)
+        params = {"address": address, "page": page, "page_size": effective_page_size}
+        payload = await client.get("/account/transactions", params=params)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not data:
+            break
+        if isinstance(data, list):
+            collected.extend(data)
+        else:
+            collected.append(data)
+        if limit is not None and len(collected) >= limit:
+            break
+        page += 1
+    logger.info("Fetched %d Solscan transactions for address %s", len(collected), address)
+    if limit is not None and len(collected) > limit:
+        return collected[:limit]
+    return collected
+
+
+async def solscan_fetch_transaction_detail(
+    client: SolscanClient,
+    signature: str,
+    cache: Dict[str, Any],
+    logger: logging.Logger,
+) -> Optional[Dict[str, Any]]:
+    if signature in cache:
+        return cache[signature]
+    try:
+        payload = await client.get("/transaction/detail", params={"tx": signature})
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to load Solscan transaction %s: %s", signature, exc)
+        return None
+    detail = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(detail, dict):
+        cache[signature] = detail
+    else:
+        cache[signature] = None
+    return cache[signature]
+
+
+async def solscan_decode_account(
+    client: SolscanClient,
+    address: str,
+    logger: logging.Logger,
+) -> Optional[Dict[str, Any]]:
+    try:
+        payload = await client.get("/account/data-decoded", params={"address": address})
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to decode Solscan account %s: %s", address, exc)
+        return None
+    decoded = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(decoded, dict):
+        return None
+    return decoded
+
+
+def parse_stake_account_from_decoded(
+    address: str,
+    decoded: Optional[Dict[str, Any]],
+    fallback_entry: Optional[Dict[str, Any]] = None,
+) -> StakeAccount:
+    lamports = None
+    parsed: Optional[Dict[str, Any]] = None
+    if decoded:
+        account = decoded.get("account") or {}
+        if isinstance(account, dict):
+            lamports = safe_int(account.get("lamports"))
+        data_section = decoded.get("data") or {}
+        if isinstance(data_section, dict) and isinstance(data_section.get("parsed"), dict):
+            parsed = data_section.get("parsed")
+        elif isinstance(decoded.get("parsed"), dict):
+            parsed = decoded.get("parsed")
+
+    stake_type = parsed.get("type") if isinstance(parsed, dict) else None
+    info = parsed.get("info") if isinstance(parsed, dict) else {}
+    if not isinstance(info, dict):
+        info = {}
+    meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
+    stake_data = info.get("stake") if isinstance(info.get("stake"), dict) else {}
+    delegation = stake_data.get("delegation") if isinstance(stake_data.get("delegation"), dict) else {}
+
+    validator_vote = _extract_string(
+        delegation,
+        ("voteAccount", "voter", "votePubkey", "votePubkeyAddress", "vote_pubkey"),
+    )
+    delegated_lamports = safe_int(delegation.get("stake")) or 0
+    activation_epoch = normalize_epoch(
+        delegation.get("activationEpoch")
+        or delegation.get("activation_epoch")
+    )
+    deactivation_epoch = normalize_epoch(
+        delegation.get("deactivationEpoch")
+        or delegation.get("deactivation_epoch")
+    )
+
+    authorized_section = meta.get("authorized") if isinstance(meta.get("authorized"), dict) else {}
+    rent_reserve = safe_int(meta.get("rentExemptReserve") or meta.get("rent_exempt_reserve"))
+    lockup = meta.get("lockup") if isinstance(meta.get("lockup"), dict) else {}
+
+    fallback_validator = None
+    if not validator_vote and fallback_entry:
+        fallback_validator = _extract_string(
+            fallback_entry,
+            ("vote_address", "validator_vote", "validator", "validatorVoteAccount", "voteAccount"),
+        )
+
+    account_balance_lamports = lamports if lamports is not None else safe_int(
+        (fallback_entry or {}).get("balance")
+    )
+
+    stake_account = StakeAccount(
+        pubkey=address,
+        delegated_lamports=delegated_lamports,
+        validator_vote=validator_vote or fallback_validator,
+        activation_epoch=activation_epoch,
+        deactivation_epoch=deactivation_epoch,
+        authorized_staker=authorized_section.get("staker"),
+        authorized_withdrawer=authorized_section.get("withdrawer"),
+        rent_exempt_reserve_lamports=rent_reserve,
+        stake_type=stake_type or (fallback_entry or {}).get("status"),
+        account_balance_lamports=account_balance_lamports,
+        lockup=lockup,
+    )
+
+    if stake_account.stake_type is None:
+        if fallback_entry and fallback_entry.get("status"):
+            stake_account.stake_type = fallback_entry.get("status")
+        elif decoded is None:
+            stake_account.stake_type = "historical_only"
+
+    return stake_account
+
+
+async def solscan_fetch_rewards_for_account(
+    client: SolscanClient,
+    address: str,
+    page_size: int,
+    logger: logging.Logger,
+) -> List[RewardRecord]:
+    records: List[RewardRecord] = []
+    page = 1
+    while True:
+        params = {
+            "address": address,
+            "page": page,
+            "page_size": page_size,
+            "type": "stake",
+            "category": "stake",
+        }
+        try:
+            payload = await client.get("/account/reward", params=params)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to load Solscan rewards for %s (page %d): %s", address, page, exc)
+            break
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not data:
+            break
+        rows: List[Any]
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            rows = data.get("data") or data.get("rewards") or []
+        else:
+            rows = []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            epoch = safe_int(row.get("epoch"))
+            amount = safe_int(row.get("amount")) or 0
+            post_balance = safe_int(row.get("post_balance") or row.get("postBalance")) or 0
+            effective_slot = safe_int(row.get("slot") or row.get("effective_slot") or row.get("effectiveSlot"))
+            commission = safe_int(row.get("commission"))
+            record = RewardRecord(
+                epoch=epoch or 0,
+                amount_lamports=amount,
+                post_balance_lamports=post_balance,
+                effective_slot=effective_slot,
+                commission=commission,
+            )
+            block_time = safe_int(row.get("block_time") or row.get("blockTime"))
+            if block_time:
+                record.block_time = block_time
+            records.append(record)
+        if len(rows) < page_size:
+            break
+        page += 1
+    logger.info("Loaded %d Solscan reward records for %s", len(records), address)
+    return records
+
+
+async def solscan_populate_rewards(
+    client: SolscanClient,
+    stake_accounts: Dict[str, StakeAccount],
+    page_size: int,
+    average_slot_time_seconds: float,
+    slots_in_epoch: Optional[int],
+    logger: logging.Logger,
+) -> None:
+    for address, account in stake_accounts.items():
+        rewards = await solscan_fetch_rewards_for_account(client, address, page_size, logger)
+        if not rewards:
+            continue
+        account.rewards = rewards
+        account.total_rewards_lamports = sum(record.amount_lamports for record in rewards)
+        account.first_reward_slot = next((record.effective_slot for record in rewards if record.effective_slot is not None), None)
+        account.last_reward_slot = next(
+            (record.effective_slot for record in reversed(rewards) if record.effective_slot is not None),
+            None,
+        )
+
+        cached_times = [record.block_time for record in rewards if record.block_time is not None]
+        if cached_times:
+            account.first_reward_time = datetime.fromtimestamp(min(cached_times), tz=timezone.utc)
+            account.last_reward_time = datetime.fromtimestamp(max(cached_times), tz=timezone.utc)
+        elif account.first_reward_slot is not None and account.last_reward_slot is not None and slots_in_epoch and slots_in_epoch > 0:
+            duration = compute_duration_days_from_epochs(
+                rewards[0].epoch,
+                rewards[-1].epoch,
+                slots_in_epoch,
+                average_slot_time_seconds,
+            )
+            account.duration_days = duration
+
+        if account.first_reward_time and account.last_reward_time:
+            delta = account.last_reward_time - account.first_reward_time
+            if delta.total_seconds() > 0:
+                account.duration_days = max(delta.total_seconds() / 86_400, 0.0)
+
+        if account.delegated_lamports > 0 and account.total_rewards_lamports > 0:
+            account.realized_yield_pct = (account.total_rewards_lamports / account.delegated_lamports) * 100
+            if account.duration_days and account.duration_days > 0:
+                account.annualized_yield_pct = account.realized_yield_pct * (365 / account.duration_days)
+
+
+async def solscan_build_validator_lookup(
+    client: SolscanClient,
+    validator_votes: Set[str],
+    logger: logging.Logger,
+) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for vote_account in validator_votes:
+        decoded = await solscan_decode_account(client, vote_account, logger)
+        if not decoded:
+            continue
+        data_section = decoded.get("data") if isinstance(decoded.get("data"), dict) else {}
+        parsed = data_section.get("parsed") if isinstance(data_section.get("parsed"), dict) else decoded.get("parsed")
+        info = parsed.get("info") if isinstance(parsed, dict) else {}
+        if not isinstance(info, dict):
+            continue
+        commission = safe_int(info.get("commission"))
+        epoch_credits = info.get("epochCredits") or info.get("epoch_credits") or []
+        if isinstance(epoch_credits, list) and epoch_credits and isinstance(epoch_credits[0], dict):
+            # Convert list of dicts to list of lists if needed.
+            converted: List[List[int]] = []
+            for entry in epoch_credits:
+                epoch = safe_int(entry.get("epoch")) or 0
+                credits = safe_int(entry.get("credits")) or 0
+                prev_credits = safe_int(entry.get("prevCredits") or entry.get("previousCredits")) or 0
+                converted.append([epoch, credits, prev_credits])
+            epoch_credits = converted
+        activated_stake = safe_int(info.get("activatedStake") or info.get("activated_stake"))
+        lookup[vote_account] = {
+            "votePubkey": vote_account,
+            "commission": commission,
+            "epochCredits": epoch_credits if isinstance(epoch_credits, list) else [],
+            "activatedStake": activated_stake,
+            "delinquent": info.get("delinquent", False),
+        }
+    return lookup
+
+
+async def solscan_fetch_network_context(
+    client: SolscanClient,
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    context: Dict[str, Any] = {}
+    try:
+        epoch_payload = await client.get("/cluster/epoch-info")
+        epoch_data = epoch_payload.get("data") if isinstance(epoch_payload, dict) else epoch_payload
+        if isinstance(epoch_data, dict):
+            context["current_epoch"] = safe_int(epoch_data.get("epoch"))
+            context["absolute_slot"] = safe_int(epoch_data.get("absoluteSlot") or epoch_data.get("absolute_slot"))
+            context["slots_in_epoch"] = safe_int(epoch_data.get("slotsInEpoch") or epoch_data.get("slots_in_epoch"))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to fetch Solscan epoch info: %s", exc)
+
+    try:
+        performance_payload = await client.get("/cluster/performance")
+        performance_data = performance_payload.get("data") if isinstance(performance_payload, dict) else performance_payload
+        if isinstance(performance_data, list) and performance_data:
+            context["average_slot_time_seconds"] = compute_average_slot_time_seconds(performance_data)
+        elif isinstance(performance_data, dict):
+            context["average_slot_time_seconds"] = compute_average_slot_time_seconds([performance_data])
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to fetch Solscan performance samples: %s", exc)
+
+    try:
+        inflation_payload = await client.get("/cluster/inflation-rate")
+        inflation_data = inflation_payload.get("data") if isinstance(inflation_payload, dict) else inflation_payload
+        if isinstance(inflation_data, dict):
+            context["network_inflation"] = inflation_data
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to fetch Solscan inflation rate: %s", exc)
+
+    return context
+
+
+async def run_with_solscan(
+    config: Dict[str, Any],
+    logger: logging.Logger,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    wallet_address = config["wallet_address"]
+    page_size = safe_int(config.get("solscan_page_size")) or SOLSCAN_DEFAULT_PAGE_SIZE
+    max_wallet_signatures = safe_int(config.get("max_wallet_signatures"))
+    max_stake_signatures = safe_int(config.get("max_stake_signatures"))
+    api_key = config.get("solscan_api_key")
+    base_url = config.get("solscan_base_url", SOLSCAN_API_BASE)
+    concurrency_limit = max(1, safe_int(config.get("concurrency_limit")) or 4)
+
+    stake_accounts: Dict[str, StakeAccount] = {}
+    wallet_transactions: List[Dict[str, Any]] = []
+
+    transaction_cache: Dict[str, Any] = {}
+    history_meta: Dict[str, Dict[str, Any]] = {}
+    address_events: Dict[str, List[DelegationEvent]] = {}
+    recorded_signatures: Dict[str, Set[str]] = {}
+
+    async with SolscanClient(api_key, concurrency_limit, base_url=base_url, timeout=35.0) as client:
+        network_context = await solscan_fetch_network_context(client, logger)
+        average_slot_time_seconds = network_context.get("average_slot_time_seconds")
+        if average_slot_time_seconds is None:
+            average_slot_time_seconds = 0.4
+            network_context["average_slot_time_seconds"] = average_slot_time_seconds
+
+        slots_in_epoch = network_context.get("slots_in_epoch")
+
+        current_entries = await solscan_fetch_current_stake_accounts(client, wallet_address, page_size, logger)
+        all_addresses: Set[str] = set(current_entries.keys())
+
+        wallet_transactions = await solscan_fetch_transactions_for_address(
+            client,
+            wallet_address,
+            max_wallet_signatures,
+            page_size,
+            logger,
+        )
+
+        for summary in reversed(wallet_transactions):
+            signature = summary.get("tx_hash") or summary.get("signature") or summary.get("txHash")
+            if not signature:
+                continue
+            detail = await solscan_fetch_transaction_detail(client, signature, transaction_cache, logger)
+            if not detail:
+                continue
+            programs = detail.get("programs_involved") or detail.get("programsInvolved") or []
+            if programs and STAKE_PROGRAM_ID not in programs:
+                continue
+            instructions = detail.get("parsed_instructions") or detail.get("parsedInstructions") or []
+            if isinstance(instructions, list):
+                for instr in instructions:
+                    if isinstance(instr, dict):
+                        for addr in try_extract_stake_accounts_from_instruction(instr):
+                            if addr not in all_addresses:
+                                all_addresses.add(addr)
+            events = extract_delegate_events(detail, None, signature)
+            for event in events:
+                stake_addr = event.stake_account
+                if not stake_addr:
+                    continue
+                seen = recorded_signatures.setdefault(stake_addr, set())
+                if signature in seen:
+                    continue
+                address_events.setdefault(stake_addr, []).append(event)
+                seen.add(signature)
+                _update_history_meta(history_meta, stake_addr, event.block_time, signature)
+
+        pending = list(all_addresses)
+        processed_accounts: Set[str] = set()
+        while pending:
+            stake_addr = pending.pop()
+            if stake_addr in processed_accounts:
+                continue
+            processed_accounts.add(stake_addr)
+            account_transactions = await solscan_fetch_transactions_for_address(
+                client,
+                stake_addr,
+                max_stake_signatures,
+                page_size,
+                logger,
+            )
+            for summary in reversed(account_transactions):
+                signature = summary.get("tx_hash") or summary.get("signature") or summary.get("txHash")
+                if not signature:
+                    continue
+                detail = await solscan_fetch_transaction_detail(client, signature, transaction_cache, logger)
+                if not detail:
+                    continue
+                instructions = detail.get("parsed_instructions") or detail.get("parsedInstructions") or []
+                if isinstance(instructions, list):
+                    for instr in instructions:
+                        if isinstance(instr, dict):
+                            for addr in try_extract_stake_accounts_from_instruction(instr):
+                                if addr not in all_addresses:
+                                    all_addresses.add(addr)
+                                    pending.append(addr)
+                events = extract_delegate_events(detail, stake_addr, signature)
+                if not events:
+                    continue
+                seen = recorded_signatures.setdefault(stake_addr, set())
+                if signature in seen:
+                    continue
+                address_events.setdefault(stake_addr, []).extend(events)
+                seen.add(signature)
+                for event in events:
+                    _update_history_meta(history_meta, stake_addr, event.block_time, signature)
+
+        for address in sorted(all_addresses):
+            decoded = await solscan_decode_account(client, address, logger)
+            stake_account = parse_stake_account_from_decoded(address, decoded, current_entries.get(address))
+            events = address_events.get(address, [])
+            events.sort(key=lambda event: (event.block_time or 0, event.slot or 0, event.signature))
+            if events:
+                stake_account.delegation_history = events
+                validators = [event.vote_account for event in events if event.vote_account]
+                if validators:
+                    stake_account.historical_validators = list(dict.fromkeys(validators))
+                    if not stake_account.validator_vote:
+                        stake_account.validator_vote = validators[-1]
+            meta = history_meta.get(address)
+            if meta:
+                stake_account.first_seen_unix = meta.get("first_seen")
+                stake_account.last_seen_unix = meta.get("last_seen")
+                stake_account.history_signature_count = len(meta.get("seen_in") or [])
+            stake_accounts[address] = stake_account
+
+        await solscan_populate_rewards(
+            client,
+            stake_accounts,
+            page_size,
+            average_slot_time_seconds,
+            slots_in_epoch,
+            logger,
+        )
+
+        validator_votes = {account.validator_vote for account in stake_accounts.values() if account.validator_vote}
+        validator_lookup = await solscan_build_validator_lookup(client, validator_votes, logger)
+        inflation_rate = network_context.get("network_inflation") or {}
+
+        validator_rows, stake_rows = analyze_validators(
+            stake_accounts,
+            validator_lookup,
+            inflation_rate,
+            slots_in_epoch or 0,
+        )
+
+    pipeline_context = {
+        "solscan_base_url": base_url,
+        "solscan_page_size": page_size,
+        "solscan_wallet_transaction_count": len(wallet_transactions),
+        "stake_account_count": len(stake_accounts),
+        "validator_count": len(validator_rows),
+        "solscan_history_tracked_accounts": len(history_meta),
+        "solscan_historical_only_count": sum(
+            1 for account in stake_accounts.values() if account.stake_type == "historical_only"
+        ),
+    }
+    for key in ("current_epoch", "absolute_slot", "slots_in_epoch", "average_slot_time_seconds", "network_inflation"):
+        if key in network_context:
+            pipeline_context[key] = network_context[key]
+
+    return validator_rows, stake_rows, pipeline_context
+
+
 async def fetch_delegation_history(
     client: SolanaRPCClient,
     stake_accounts: Dict[str, StakeAccount],
-    max_signatures: int,
+    wallet_address: str,
+    stake_max_signatures: Optional[int],
+    wallet_max_signatures: Optional[int],
     transaction_cache: Dict[str, Any],
     transaction_backoff_seconds: float,
     logger: logging.Logger,
 ) -> None:
-    for pubkey, account in stake_accounts.items():
-        logger.info("Retrieving delegation history for stake account %s", pubkey)
+    def _resolve_limit(limit: Optional[int]) -> Optional[int]:
+        if limit is None:
+            return None
+        if limit <= 0:
+            return None
+        return limit
+
+    stake_limit = _resolve_limit(stake_max_signatures)
+    wallet_limit = _resolve_limit(wallet_max_signatures)
+
+    async def _fetch_signatures_for_address(address: str, limit_cap: Optional[int], description: str) -> List[Dict[str, Any]]:
         signatures: List[Dict[str, Any]] = []
         before: Optional[str] = None
-        while len(signatures) < max_signatures:
-            remaining = max_signatures - len(signatures)
-            limit = min(1000, remaining)
-            params: List[Any] = [pubkey, {"limit": limit}]
+        while limit_cap is None or len(signatures) < limit_cap:
+            remaining = limit_cap - len(signatures) if limit_cap is not None else 1000
+            limit = min(1000, remaining) if limit_cap is not None else 1000
+            if limit <= 0:
+                break
+            params: List[Any] = [address, {"limit": limit}]
             if before:
                 params[1]["before"] = before
             batch = await client.request("getSignaturesForAddress", params)
@@ -520,69 +1419,137 @@ async def fetch_delegation_history(
                 break
             before = batch[-1].get("signature")
 
-        logger.info("Fetched %d signatures for stake account %s", len(signatures), pubkey)
+        if limit_cap is not None and len(signatures) >= limit_cap and before:
+            logger.warning(
+                "Signature fetch for %s capped at %d records; older history may exist. Increase limits to include more.",
+                description,
+                limit_cap,
+            )
 
-        account.delegation_history.clear()
-        for sig_info in reversed(signatures):
+        return signatures
+
+    async def _load_transaction(signature: str) -> Optional[Dict[str, Any]]:
+        tx = transaction_cache.get(signature)
+        if tx is None:
+            tx = await client.request(
+                "getTransaction",
+                [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            )
+            if tx:
+                transaction_cache[signature] = tx
+            await asyncio.sleep(max(transaction_backoff_seconds, 0.0))
+        return tx
+
+    recorded_signatures: Dict[str, Set[str]] = {pubkey: set() for pubkey in stake_accounts}
+
+    async def _ingest_account_history(
+        pubkey: str,
+        account: StakeAccount,
+        limit_cap: Optional[int],
+        reset_history: bool,
+    ) -> None:
+        signature_batch = await _fetch_signatures_for_address(pubkey, limit_cap, f"stake account {pubkey}")
+        logger.info("Fetched %d signatures for stake account %s", len(signature_batch), pubkey)
+
+        if reset_history:
+            account.delegation_history.clear()
+            recorded_signatures[pubkey] = set()
+
+        seen_signatures = recorded_signatures.setdefault(pubkey, set())
+
+        for sig_info in reversed(signature_batch):
             signature = sig_info.get("signature")
-            if not signature:
+            if not signature or signature in seen_signatures:
                 continue
-            tx = transaction_cache.get(signature)
-            if tx is None:
-                tx = await client.request(
-                    "getTransaction",
-                    [
-                        signature,
-                        {
-                            "encoding": "jsonParsed",
-                            "maxSupportedTransactionVersion": 0,
-                        },
-                    ],
-                )
-                if tx:
-                    transaction_cache[signature] = tx
-                await asyncio.sleep(max(transaction_backoff_seconds, 0.0))
+            tx = await _load_transaction(signature)
             if not tx:
                 continue
-            block_time = safe_int(tx.get("blockTime"))
-            slot = safe_int(tx.get("slot"))
-            message = ((tx.get("transaction") or {}).get("message")) or {}
-            instructions: List[Dict[str, Any]] = list(message.get("instructions") or [])
-            meta = tx.get("meta") or {}
-            for inner in meta.get("innerInstructions") or []:
-                instructions.extend(inner.get("instructions") or [])
+            events = extract_delegate_events(tx, pubkey, signature)
+            if not events:
+                continue
+            account.delegation_history.extend(events)
+            seen_signatures.add(signature)
 
-            for instruction in instructions:
-                parsed = instruction.get("parsed") or {}
-                if not parsed:
-                    continue
-                program = instruction.get("program")
-                program_id = instruction.get("programId")
-                if program != "stake" and program_id != STAKE_PROGRAM_ID:
-                    continue
-                info = parsed.get("info") or {}
-                instruction_type = parsed.get("type") or instruction.get("type")
-                vote_account = (
-                    info.get("voteAccount")
-                    or info.get("vote_account")
-                    or info.get("votePubkey")
-                    or info.get("vote_pubkey")
-                )
-                if not vote_account:
-                    continue
-                if instruction_type and "delegate" not in instruction_type.lower():
-                    continue
-                event = DelegationEvent(
-                    signature=signature,
-                    slot=slot,
-                    block_time=block_time,
-                    vote_account=vote_account,
-                    instruction_type=instruction_type,
-                    stake_account=pubkey,
-                )
-                account.delegation_history.append(event)
+    for pubkey, account in stake_accounts.items():
+        logger.info("Retrieving delegation history for stake account %s", pubkey)
+        await _ingest_account_history(pubkey, account, stake_limit, reset_history=True)
 
-        if account.validator_vote and all(event.vote_account != account.validator_vote for event in account.delegation_history):
+    initial_account_count = len(stake_accounts)
+    logger.info("Scanning root wallet %s for historical delegation events", wallet_address)
+    wallet_signatures = await _fetch_signatures_for_address(wallet_address, wallet_limit, f"wallet {wallet_address}")
+    logger.info("Fetched %d signatures for wallet %s", len(wallet_signatures), wallet_address)
+
+    newly_discovered_accounts: Set[str] = set()
+
+    for sig_info in reversed(wallet_signatures):
+        signature = sig_info.get("signature")
+        if not signature:
+            continue
+        tx = await _load_transaction(signature)
+        if not tx:
+            continue
+        events = extract_delegate_events(tx, None, signature)
+        if not events:
+            continue
+        for event in events:
+            stake_pubkey = event.stake_account
+            if not stake_pubkey:
+                continue
+            account = stake_accounts.get(stake_pubkey)
+            if account is None:
+                account = StakeAccount(
+                    pubkey=stake_pubkey,
+                    delegated_lamports=0,
+                    validator_vote=event.vote_account,
+                    activation_epoch=None,
+                    deactivation_epoch=None,
+                    authorized_staker=None,
+                    authorized_withdrawer=None,
+                    rent_exempt_reserve_lamports=None,
+                    stake_type="historical_only",
+                    account_balance_lamports=None,
+                    lockup={},
+                )
+                stake_accounts[stake_pubkey] = account
+                recorded_signatures[stake_pubkey] = set()
+                newly_discovered_accounts.add(stake_pubkey)
+            seen_signatures = recorded_signatures.setdefault(stake_pubkey, set())
+            if signature in seen_signatures:
+                continue
+            account.delegation_history.append(event)
+            seen_signatures.add(signature)
+            if not account.validator_vote:
+                account.validator_vote = event.vote_account
+
+    for pubkey in newly_discovered_accounts:
+        account = stake_accounts[pubkey]
+        logger.info("Retrieving delegation history for newly discovered stake account %s", pubkey)
+        await _ingest_account_history(pubkey, account, stake_limit, reset_history=False)
+
+    newly_discovered = len(stake_accounts) - initial_account_count
+    if newly_discovered > 0:
+        logger.info(
+            "Discovered %d additional historical stake accounts via wallet transaction history",
+            newly_discovered,
+        )
+
+    for account in stake_accounts.values():
+        account.delegation_history.sort(
+            key=lambda event: (
+                event.block_time or 0,
+                event.slot or 0,
+                event.signature,
+            )
+        )
+        if account.validator_vote and all(
+            event.vote_account != account.validator_vote for event in account.delegation_history if event.vote_account
+        ):
             account.delegation_history.append(
                 DelegationEvent(
                     signature="CURRENT_STATE",
@@ -590,11 +1557,14 @@ async def fetch_delegation_history(
                     block_time=None,
                     vote_account=account.validator_vote,
                     instruction_type="current_delegation",
-                    stake_account=pubkey,
+                    stake_account=account.pubkey,
                 )
             )
-
-        unique_validators = list(dict.fromkeys(event.vote_account for event in account.delegation_history))
+        unique_validators = list(
+            dict.fromkeys(
+                event.vote_account for event in account.delegation_history if event.vote_account
+            )
+        )
         account.historical_validators = unique_validators
 
 
@@ -788,6 +1758,9 @@ def analyze_validators(
                 "historical_validators": account.historical_validators,
                 "delegation_history": [event.to_dict() for event in account.delegation_history],
                 "delegation_event_count": len(account.delegation_history),
+                "first_seen_unix": account.first_seen_unix,
+                "last_seen_unix": account.last_seen_unix,
+                "history_signature_count": account.history_signature_count,
             }
         )
 
@@ -980,23 +1953,15 @@ def _get_last_event_iso(events: Optional[List[DelegationEvent]]) -> Optional[str
     return None
 
 
-async def run() -> None:
-    base_dir = Path(__file__).resolve().parent
-    config = load_config(base_dir / CONFIG_FILENAME, base_dir / "wallet_config.json")
-
-    logging.basicConfig(
-        level=getattr(logging, str(config.get("log_level", "INFO")).upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logger = logging.getLogger("solana_staking_analyzer")
-
+async def run_with_rpc(
+    config: Dict[str, Any],
+    logger: logging.Logger,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     wallet_address = config["wallet_address"]
     transaction_backoff_seconds = float(config.get("transaction_backoff_seconds", 0.35) or 0.35)
     transaction_cache: Dict[str, Any] = {}
-    logger.info("Starting staking analysis for wallet %s", wallet_address)
 
-    async with SolanaRPCClient(config["rpc_endpoints"], config["concurrency_limit"]) as client:
+    async with SolanaRPCClient(config["rpc_endpoint_groups"], config["concurrency_limit"]) as client:
         epoch_info = await client.request("getEpochInfo")
         if not epoch_info:
             raise RPCError("Failed to retrieve epoch info")
@@ -1015,57 +1980,98 @@ async def run() -> None:
         inflation_rate = await client.request("getInflationRate")
 
         stake_accounts = await fetch_stake_accounts(client, wallet_address, logger)
-        if not stake_accounts:
-            logger.warning("No stake accounts detected. Nothing to analyze.")
-            return
-
-        activation_epochs = [acc.activation_epoch for acc in stake_accounts.values() if acc.activation_epoch is not None]
-        start_epoch = min(activation_epochs) if activation_epochs else current_epoch
-        await fetch_inflation_rewards(client, stake_accounts, start_epoch, current_epoch, logger)
-
-        await enrich_stake_account_metrics(client, stake_accounts, slots_in_epoch, average_slot_time_seconds, logger)
+        if stake_accounts:
+            activation_epochs = [acc.activation_epoch for acc in stake_accounts.values() if acc.activation_epoch is not None]
+            start_epoch = min(activation_epochs) if activation_epochs else current_epoch
+            await fetch_inflation_rewards(client, stake_accounts, start_epoch, current_epoch, logger)
+            await enrich_stake_account_metrics(client, stake_accounts, slots_in_epoch, average_slot_time_seconds, logger)
+        else:
+            logger.warning(
+                "No active stake accounts detected via stake program; continuing with historical wallet scan."
+            )
 
         await fetch_delegation_history(
             client,
             stake_accounts,
-            safe_int(config.get("max_transaction_signatures")) or 2000,
+            wallet_address,
+            safe_int(config.get("max_stake_signatures")),
+            safe_int(config.get("max_wallet_signatures")),
             transaction_cache,
             transaction_backoff_seconds,
             logger,
         )
 
+        if not stake_accounts:
+            logger.warning("No stake activity detected for wallet %s", wallet_address)
+
         vote_accounts = await client.request("getVoteAccounts") or {}
         validator_lookup = build_validator_lookup(vote_accounts)
 
-        validator_rows, stake_rows = analyze_validators(stake_accounts, validator_lookup, inflation_rate or {}, slots_in_epoch)
+        validator_rows, stake_rows = analyze_validators(
+            stake_accounts,
+            validator_lookup,
+            inflation_rate or {},
+            slots_in_epoch,
+        )
 
-        timestamp = datetime.now(tz=timezone.utc).isoformat()
-        context = {
-            "wallet_address": wallet_address,
-            "generated_at": timestamp,
-            "rpc_endpoint": config["rpc_endpoint"],
-            "rpc_endpoints": config["rpc_endpoints"],
-            "current_epoch": current_epoch,
-            "absolute_slot": absolute_slot,
-            "slots_in_epoch": slots_in_epoch,
-            "average_slot_time_seconds": average_slot_time_seconds,
-            "network_inflation": inflation_rate,
-            "stake_account_count": len(stake_accounts),
-            "validator_count": len(validator_rows),
-        }
+    pipeline_context = {
+        "rpc_endpoint": config.get("rpc_endpoint"),
+        "rpc_endpoints": config.get("rpc_endpoints"),
+        "rpc_endpoint_groups": config.get("rpc_endpoint_groups"),
+        "current_epoch": current_epoch,
+        "absolute_slot": absolute_slot,
+        "slots_in_epoch": slots_in_epoch,
+        "average_slot_time_seconds": average_slot_time_seconds,
+        "network_inflation": inflation_rate,
+        "stake_account_count": len(stake_accounts),
+        "validator_count": len(validator_rows),
+    }
 
-        formats = [fmt.lower() for fmt in config.get("output_format", [])]
-        if "console" in formats:
-            render_console_output(validator_rows, stake_rows, logger)
+    return validator_rows, stake_rows, pipeline_context
 
-        if "json" in formats:
-            json_path = base_dir / config["json_output_file"]
-            write_json_output(json_path, context, validator_rows, stake_rows, logger)
 
-        if "csv" in formats:
-            validator_csv_path = base_dir / config["csv_output_file"]
-            stake_csv_path = base_dir / config["stake_accounts_csv_output_file"]
-            write_csv_outputs(validator_csv_path, stake_csv_path, validator_rows, stake_rows, logger)
+async def run() -> None:
+    base_dir = Path(__file__).resolve().parent
+    config = load_config(base_dir / CONFIG_FILENAME, base_dir / "wallet_config.json")
+
+    logging.basicConfig(
+        level=getattr(logging, str(config.get("log_level", "INFO")).upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logger = logging.getLogger("solana_staking_analyzer")
+
+    wallet_address = config["wallet_address"]
+    logger.info("Starting staking analysis for wallet %s", wallet_address)
+
+    data_source = config.get("data_source", "solscan")
+    if data_source == "solscan":
+        validator_rows, stake_rows, pipeline_context = await run_with_solscan(config, logger)
+    else:
+        validator_rows, stake_rows, pipeline_context = await run_with_rpc(config, logger)
+
+    timestamp = datetime.now(tz=timezone.utc).isoformat()
+    context: Dict[str, Any] = {
+        "wallet_address": wallet_address,
+        "generated_at": timestamp,
+        "data_source": data_source,
+    }
+    for key, value in pipeline_context.items():
+        if value is not None:
+            context[key] = value
+
+    formats = [fmt.lower() for fmt in config.get("output_format", [])]
+    if "console" in formats:
+        render_console_output(validator_rows, stake_rows, logger)
+
+    if "json" in formats:
+        json_path = base_dir / config["json_output_file"]
+        write_json_output(json_path, context, validator_rows, stake_rows, logger)
+
+    if "csv" in formats:
+        validator_csv_path = base_dir / config["csv_output_file"]
+        stake_csv_path = base_dir / config["stake_accounts_csv_output_file"]
+        write_csv_outputs(validator_csv_path, stake_csv_path, validator_rows, stake_rows, logger)
 
 
 def main() -> None:
