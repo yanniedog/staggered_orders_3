@@ -360,8 +360,10 @@ class StaggeredLadderCalculator:
     def _generate_results(self) -> Dict:
         """Generate results dictionary with statistics."""
         # Calculate cumulative statistics
-        bottom_buy_price = min(self.buy_prices) if self.buy_prices else 0.0
-        top_sell_price = max(self.sell_prices) if self.sell_prices else 0.0
+        buy_price_count = int(np.size(self.buy_prices))
+        sell_price_count = int(np.size(self.sell_prices))
+        bottom_buy_price = float(np.min(self.buy_prices)) if buy_price_count else 0.0
+        top_sell_price = float(np.max(self.sell_prices)) if sell_price_count else 0.0
         shape_profile = LADDER_SHAPE_PROFILES.get(self.ladder_shape_key)
         shape_label = self.ladder_shape_label or (shape_profile.label if shape_profile else "")
         shape_description = shape_profile.description if shape_profile else ""
