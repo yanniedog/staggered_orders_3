@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+Simplified Staggered Order Ladder Calculator
+
+Calculates buy and sell ladder orders based on user-specified price rungs
+or profit targets. Outputs results to Excel and PDF with visualizations.
+"""
+
+import pandas as pd
+import numpy as np
+import logging
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+import sys
+import os
+import argparse
+from dataclasses import dataclass
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+class StaggeredLadderCalculator:
+    """Calculate staggered order ladders for buy and sell orders."""
+    
+    def __init__(self, budget: float, num_rungs: int = 10):
+        """
+        Initialize calculator.
+        
+        Args:
+            budget: Total budget for buy orders
+            num_rungs: Number of rungs in the ladder
+        """
+        # Input validation
+        if budget <= 0:
+            raise ValueError("Budget must be positive")
+        if num_rungs < 1:
+            raise ValueError("Number of rungs must be at least 1")
+        if not isinstance(num_rungs, int):
+            raise ValueError("Number of rungs must be an integer")
+        
+        self.budget = budget
+        self.num_rungs = num_rungs
+        self.buy_prices = []
+        self.buy_quantities = []
+        self.sell_prices = []
+        self.sell_quantities = []
+    
+    def _normalize_budget(self):
+        """Normalize buy quantities to exactly match budget."""
+        total_cost = sum(qty * price for qty, price in zip(self.buy_quantities, self.buy_prices))
+        if total_cost > 0:
+            scale_factor = self.budget / total_cost
+            self.buy_quantities = [qty * scale_factor for qty in self.buy_quantities]
+    
+    def _validate_prices(self):
+        """Validate that sell prices exceed buy prices for all rungs."""
+        # Ensure each sell price exceeds its corresponding buy price
+        for i in range(self.num_rungs):
+            if self.sell_prices[i] <= self.buy_prices[i]:
+                raise ValueError(
+                    f"Sell price ${self.sell_prices[i]:.2f} at rung {i+1} must exceed "
+                    f"buy price ${self.buy_prices[i]:.2f}"
+                )
+        
+        # Ensure top buy order is below bottom sell order
+        max_buy_price = max(self.buy_prices)
+        min_sell_price = min(self.sell_prices)
+        if max_buy_price >= min_sell_price:
+            raise ValueError(
+                f"Top buy order (${max_buy_price:.2f}) must be below bottom sell order (${min_sell_price:.2f}). "
+                f"Gap needed: ${min_sell_price - max_buy_price:.2f}"
+            )
+        
+    def calculate_from_profit_target(self, buy_upper: float, profit_target: float,
+                                    buy_price_range_pct: float = 30.0) -> Dict:
+        """
+        Calculate ladder from upper buy rung and profit target.
+        Uses exponential allocation strategy (buy more at lower prices, sell more at higher prices).
+        
+        Args:
+            buy_upper: Upper rung of buy ladder (highest buy price)
+            profit_target: Target profit percentage (e.g., 50 for 50%)
+            buy_price_range_pct: Percentage range for buy ladder (default 30%)
+        
+        Returns:
+            Dictionary with calculated orders and statistics
+        """
+        # Input validation
+        if buy_upper <= 0:
+            raise ValueError("Buy upper must be positive")
+        if profit_target < 10 or profit_target > 200:
+            raise ValueError("Profit target must be between 10% and 200%")
+        if buy_price_range_pct <= 0 or buy_price_range_pct > 100:
+            raise ValueError("Buy price range percentage must be between 0 and 100")
+        
+        profit_multiplier = 1 + (profit_target / 100)
+        
+        # Overall strategy returns profit_target%
+        # Calculate buy prices: ascending order (lowest to highest)
+        price_range = buy_upper * (buy_price_range_pct / 100)
+        buy_lower = buy_upper - price_range
+        if buy_lower <= 0:
+            raise ValueError(f"Buy price range results in non-positive buy_lower. "
+                           f"Try reducing buy_price_range_pct from {buy_price_range_pct}%")
+        
+        self.buy_prices = np.linspace(buy_lower, buy_upper, self.num_rungs)
+        
+        # Calculate consistent price step from buy prices
+        if self.num_rungs > 1:
+            price_step = (buy_upper - buy_lower) / (self.num_rungs - 1)
+        else:
+            price_step = buy_upper * 0.1  # Default step if only one rung
+        
+        # Calculate buy quantities using exponential allocation (buy more at lower prices)
+        weights = np.exp(np.linspace(2, 0, self.num_rungs))  # Higher weight for lower prices
+        weights = weights / weights.sum()
+        self.buy_quantities = [(self.budget * w) / price 
+                              for w, price in zip(weights, self.buy_prices)]
+        
+        # Normalize to exactly match budget
+        self._normalize_budget()
+        
+        # Calculate total cost (should equal budget after normalization)
+        total_cost = sum(qty * price for qty, price in zip(self.buy_quantities, self.buy_prices))
+        
+        # Calculate target revenue
+        target_revenue = total_cost * profit_multiplier
+        
+        # Calculate total buy quantity
+        total_buy_qty = sum(self.buy_quantities)
+        
+        # Allocate sell quantities using exponential allocation (sell more at higher prices)
+        weights = np.exp(np.linspace(0, 2, self.num_rungs))  # Higher weight for higher prices
+        weights = weights / weights.sum()
+        self.sell_quantities = [total_buy_qty * w for w in weights]
+        
+        # Calculate sell prices with consistent spacing
+        # Use the same price_step as buy prices
+        max_buy_price = max(self.buy_prices)
+        
+        # Calculate gap based on profit target to ensure sell prices start high enough
+        # For a profit target, we need sell prices to be significantly above buy prices
+        # Use profit_target% of max_buy_price as base gap, but ensure at least one price step
+        base_gap_pct = profit_target / 100.0  # e.g., 0.5 for 50% profit target
+        base_gap_size = max_buy_price * base_gap_pct * 0.5  # Use 50% of profit target as initial gap
+        # Round to nearest price_step multiple
+        gap_steps = max(1, int(np.ceil(base_gap_size / price_step)))
+        gap_size = gap_steps * price_step
+        min_sell_price = max_buy_price + gap_size
+        
+        # Create sell prices with consistent spacing using the same price_step
+        self.sell_prices = np.array([min_sell_price + i * price_step for i in range(self.num_rungs)])
+        
+        # CRITICAL: Ensure sell quantities match buy quantities exactly BEFORE revenue adjustment
+        # This ensures volume matching is maintained throughout
+        total_sell_qty_initial = sum(self.sell_quantities)
+        if total_sell_qty_initial > 0 and abs(total_sell_qty_initial - total_buy_qty) > 0.0001:
+            normalize_factor = total_buy_qty / total_sell_qty_initial
+            self.sell_quantities = [qty * normalize_factor for qty in self.sell_quantities]
+            logger.debug(f"Normalized sell quantities to match buy quantities: {total_buy_qty:.6f}")
+        
+        # Calculate current revenue with these quantities and prices
+        current_revenue = sum(price * qty for price, qty in zip(self.sell_prices, self.sell_quantities))
+        
+        # Adjust sell PRICES (not quantities) to achieve target revenue while maintaining quantity matching
+        # This preserves volume matching while achieving profit target
+        if current_revenue > 0 and abs(current_revenue - target_revenue) > 0.01:
+            price_scale = target_revenue / current_revenue
+            # Scale all sell prices proportionally to achieve target revenue
+            # This maintains relative spacing while adjusting absolute levels
+            self.sell_prices = self.sell_prices * price_scale
+            logger.debug(f"Adjusted sell price

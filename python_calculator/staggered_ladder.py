@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 import logging
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Callable, Dict, List, Tuple, Optional
 import sys
 import os
 import argparse
@@ -23,6 +23,101 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class LadderShapeProfile:
+    label: str
+    description: str
+    buy_weight_factory: Callable[[int], np.ndarray]
+    sell_weight_factory: Callable[[int], np.ndarray]
+
+
+def _exp_profile(start: float, stop: float, num: int) -> np.ndarray:
+    return np.exp(np.linspace(start, stop, num))
+
+
+def _linear_profile(start: float, stop: float, num: int) -> np.ndarray:
+    return np.linspace(start, stop, num)
+
+
+LADDER_SHAPE_PROFILES: Dict[str, LadderShapeProfile] = {
+    "balanced": LadderShapeProfile(
+        label="Balanced",
+        description="Even sizing across all rungs.",
+        buy_weight_factory=lambda n: np.ones(n, dtype=float),
+        sell_weight_factory=lambda n: np.ones(n, dtype=float)
+    ),
+    "deep-dive": LadderShapeProfile(
+        label="Deep Dive",
+        description="Heavier budget at deeper buy levels, more supply toward higher sells.",
+        buy_weight_factory=lambda n: _exp_profile(1.4, 0.0, n),
+        sell_weight_factory=lambda n: _exp_profile(0.0, 1.4, n)
+    ),
+    "springboard": LadderShapeProfile(
+        label="Springboard",
+        description="Lighter lower buys, heavier sizing near the top with quick profit taking.",
+        buy_weight_factory=lambda n: _exp_profile(0.0, 1.2, n),
+        sell_weight_factory=lambda n: _exp_profile(1.2, 0.0, n)
+    ),
+    "glide-path": LadderShapeProfile(
+        label="Glide Path",
+        description="Gradual ramp into buys and measured releases on sells.",
+        buy_weight_factory=lambda n: _linear_profile(0.6, 1.4, n),
+        sell_weight_factory=lambda n: _linear_profile(0.8, 1.2, n)
+    )
+}
+
+
+def normalize_ladder_shape_key(value: str) -> str:
+    """
+    Normalize user input for ladder shape selection to a known profile key.
+
+    Accepts dictionary keys, human-readable labels, or variations with spaces/hyphens.
+    """
+    key_candidate = value.strip().lower()
+    canonical_candidate = key_candidate.replace(" ", "-")
+
+    if canonical_candidate in LADDER_SHAPE_PROFILES:
+        return canonical_candidate
+
+    for candidate_key, profile in LADDER_SHAPE_PROFILES.items():
+        label_normalized = profile.label.strip().lower()
+        label_canonical = label_normalized.replace(" ", "-")
+        if key_candidate == label_normalized or canonical_candidate == label_canonical:
+            return candidate_key
+
+    raise ValueError(
+        f"Invalid ladder shape '{value}'. Choose from: "
+        f"{', '.join(sorted(LADDER_SHAPE_PROFILES.keys()))}"
+    )
+
+
+def compute_ladder_depth_pct(buy_prices: List[float]) -> float:
+    """
+    Compute ladder depth as percentage difference between highest and lowest buy prices.
+    """
+    if not buy_prices:
+        return 0.0
+    lowest_price = min(buy_prices)
+    highest_price = max(buy_prices)
+    if highest_price == 0:
+        return 0.0
+    return ((highest_price - lowest_price) / highest_price) * 100
+
+
+def summarize_ladder_shape(results: Dict[str, Any]) -> str:
+    """
+    Build a human-readable summary of the selected ladder shape.
+    """
+    label = results.get('ladder_shape_label', "") if isinstance(results, dict) else ""
+    description = results.get('ladder_shape_description', "") if isinstance(results, dict) else ""
+    if label and description:
+        return f"{label} - {description}"
+    if label:
+        return label
+    if description:
+        return description
+    return "N/A"
 
 
 class StaggeredLadderCalculator:
@@ -50,6 +145,8 @@ class StaggeredLadderCalculator:
         self.buy_quantities = []
         self.sell_prices = []
         self.sell_quantities = []
+        self.ladder_shape_key = ""
+        self.ladder_shape_label = ""
     
     def _normalize_budget(self):
         """Normalize buy quantities to exactly match budget."""
@@ -77,16 +174,22 @@ class StaggeredLadderCalculator:
                 f"Gap needed: ${min_sell_price - max_buy_price:.2f}"
             )
         
-    def calculate_from_profit_target(self, buy_upper: float, profit_target: float,
-                                    buy_price_range_pct: float = 30.0) -> Dict:
+    def calculate_from_profit_target(
+        self,
+        buy_upper: float,
+        profit_target: float,
+        buy_price_range_pct: float = 30.0,
+        ladder_shape_key: str = "deep-dive"
+    ) -> Dict:
         """
-        Calculate ladder from upper buy rung and profit target.
-        Uses exponential allocation strategy (buy more at lower prices, sell more at higher prices).
+        Calculate ladder from upper buy rung and profit target using a shape profile.
+        Shape profiles control buy/sell quantity weighting across rungs.
         
         Args:
             buy_upper: Upper rung of buy ladder (highest buy price)
             profit_target: Target profit percentage (e.g., 50 for 50%)
             buy_price_range_pct: Percentage range for buy ladder (default 30%)
+            ladder_shape_key: Key identifying the ladder shape profile (default "deep-dive")
         
         Returns:
             Dictionary with calculated orders and statistics
@@ -98,6 +201,14 @@ class StaggeredLadderCalculator:
             raise ValueError("Profit target must be between 10% and 200%")
         if buy_price_range_pct <= 0 or buy_price_range_pct > 100:
             raise ValueError("Buy price range percentage must be between 0 and 100")
+        
+        shape_key_normalized = ladder_shape_key.strip().lower()
+        if shape_key_normalized not in LADDER_SHAPE_PROFILES:
+            valid_keys = ', '.join(LADDER_SHAPE_PROFILES.keys())
+            raise ValueError(f"Invalid ladder shape '{ladder_shape_key}'. Choose from: {valid_keys}")
+        shape_profile = LADDER_SHAPE_PROFILES[shape_key_normalized]
+        self.ladder_shape_key = shape_key_normalized
+        self.ladder_shape_label = shape_profile.label
         
         profit_multiplier = 1 + (profit_target / 100)
         
@@ -117,11 +228,26 @@ class StaggeredLadderCalculator:
         else:
             price_step = buy_upper * 0.1  # Default step if only one rung
         
-        # Calculate buy quantities using exponential allocation (buy more at lower prices)
-        weights = np.exp(np.linspace(2, 0, self.num_rungs))  # Higher weight for lower prices
-        weights = weights / weights.sum()
-        self.buy_quantities = [(self.budget * w) / price 
-                              for w, price in zip(weights, self.buy_prices)]
+        # Calculate buy quantities using the selected shape profile
+        buy_weights = np.asarray(shape_profile.buy_weight_factory(self.num_rungs), dtype=float)
+        if buy_weights.shape[0] != self.num_rungs:
+            raise ValueError(
+                f"Buy weight factory for shape '{shape_profile.label}' returned {buy_weights.shape[0]} weights,"
+                f" expected {self.num_rungs}."
+            )
+        if not np.isfinite(buy_weights).all():
+            raise ValueError(f"Buy weights for shape '{shape_profile.label}' must be finite values")
+        if (buy_weights < 0).any():
+            raise ValueError(f"Buy weights for shape '{shape_profile.label}' must be non-negative")
+        buy_weight_sum = buy_weights.sum()
+        if buy_weight_sum <= 0:
+            raise ValueError(f"Buy weights for shape '{shape_profile.label}' must sum to a positive value")
+        buy_weights = buy_weights / buy_weight_sum
+        self.buy_quantities = []
+        for weight, price in zip(buy_weights, self.buy_prices):
+            if price <= 0:
+                raise ValueError("Calculated buy price must be positive")
+            self.buy_quantities.append((self.budget * weight) / price)
         
         # Normalize to exactly match budget
         self._normalize_budget()
@@ -135,10 +261,22 @@ class StaggeredLadderCalculator:
         # Calculate total buy quantity
         total_buy_qty = sum(self.buy_quantities)
         
-        # Allocate sell quantities using exponential allocation (sell more at higher prices)
-        weights = np.exp(np.linspace(0, 2, self.num_rungs))  # Higher weight for higher prices
-        weights = weights / weights.sum()
-        self.sell_quantities = [total_buy_qty * w for w in weights]
+        # Allocate sell quantities using the selected shape profile
+        sell_weights = np.asarray(shape_profile.sell_weight_factory(self.num_rungs), dtype=float)
+        if sell_weights.shape[0] != self.num_rungs:
+            raise ValueError(
+                f"Sell weight factory for shape '{shape_profile.label}' returned {sell_weights.shape[0]} weights,"
+                f" expected {self.num_rungs}."
+            )
+        if not np.isfinite(sell_weights).all():
+            raise ValueError(f"Sell weights for shape '{shape_profile.label}' must be finite values")
+        if (sell_weights < 0).any():
+            raise ValueError(f"Sell weights for shape '{shape_profile.label}' must be non-negative")
+        sell_weight_sum = sell_weights.sum()
+        if sell_weight_sum <= 0:
+            raise ValueError(f"Sell weights for shape '{shape_profile.label}' must sum to a positive value")
+        sell_weights = sell_weights / sell_weight_sum
+        self.sell_quantities = [total_buy_qty * weight for weight in sell_weights]
         
         # Calculate sell prices with consistent spacing
         # Use the same price_step as buy prices
@@ -222,6 +360,11 @@ class StaggeredLadderCalculator:
     def _generate_results(self) -> Dict:
         """Generate results dictionary with statistics."""
         # Calculate cumulative statistics
+        bottom_buy_price = min(self.buy_prices) if self.buy_prices else 0.0
+        top_sell_price = max(self.sell_prices) if self.sell_prices else 0.0
+        shape_profile = LADDER_SHAPE_PROFILES.get(self.ladder_shape_key)
+        shape_label = self.ladder_shape_label or (shape_profile.label if shape_profile else "")
+        shape_description = shape_profile.description if shape_profile else ""
         cumulative_buy_cost = []
         cumulative_buy_qty = []
         cumulative_sell_revenue = []
@@ -416,7 +559,12 @@ class StaggeredLadderCalculator:
             'total_profit': total_profit,
             'profit_pct': profit_pct,
             'num_rungs': self.num_rungs,
-            'budget': self.budget
+            'budget': self.budget,
+            'bottom_buy_price': bottom_buy_price,
+            'top_sell_price': top_sell_price,
+            'ladder_shape_key': self.ladder_shape_key,
+            'ladder_shape_label': self.ladder_shape_label,
+            'ladder_shape_description': shape_description
         }
 
 
@@ -452,10 +600,18 @@ def generate_excel(results: Dict, filename: str):
     ws[f'A{row}'].font = Font(bold=True, size=14)
     row += 1
     
+    buy_prices = list(results.get('buy_prices', []))
+    ladder_depth_pct = compute_ladder_depth_pct(buy_prices)
+    ladder_shape_summary = summarize_ladder_shape(results)
+    
     summary_data = [
         ['Total Budget', f"${results['budget']:,.2f}"],
         ['Starting Price', f"${results['buy_prices'][-1]:,.2f}" if results['buy_prices'] else "$0.00"],
         ['Number of Rungs', results['num_rungs']],
+        ['Ladder Shape', ladder_shape_summary],
+        ['Ladder Depth', f"{ladder_depth_pct:.2f}%"],
+        ['Bottom Buy Price', f"${results['bottom_buy_price']:,.2f}"],
+        ['Top Sell Price', f"${results['top_sell_price']:,.2f}"],
         ['Total Cost', f"${results['total_cost']:,.2f}"],
         ['Total Revenue', f"${results['total_revenue']:,.2f}"],
         ['Total Profit', f"${results['total_profit']:,.2f}"],
@@ -626,10 +782,18 @@ def _create_summary_figure(results: Dict, configs: Tuple[OrderSideConfig, OrderS
         fontweight='bold'
     )
 
+    buy_prices = list(results.get('buy_prices', []))
+    ladder_depth_pct = compute_ladder_depth_pct(buy_prices)
+    ladder_shape_summary = summarize_ladder_shape(results)
+    
     summary_text = (
         f"\nSummary:\n"
         f"  Total Budget: ${results['budget']:,.2f}\n"
         f"  Number of Rungs: {results['num_rungs']}\n"
+        f"  Ladder Shape: {ladder_shape_summary}\n"
+        f"  Ladder Depth: {ladder_depth_pct:.2f}%\n"
+        f"  Bottom Buy Price: ${results['bottom_buy_price']:,.2f}\n"
+        f"  Top Sell Price: ${results['top_sell_price']:,.2f}\n"
         f"  Total Cost: ${results['total_cost']:,.2f}\n"
         f"  Total Revenue: ${results['total_revenue']:,.2f}\n"
         f"  Total Profit: ${results['total_profit']:,.2f}\n"
@@ -1122,6 +1286,87 @@ def get_smart_input(args: Optional[argparse.Namespace] = None) -> Dict:
     print("Staggered Order Ladder Calculator")
     print("="*60 + "\n")
     
+    argv_tokens = sys.argv[1:] if args else []
+    
+    def argument_was_provided(flag_names: Tuple[str, ...]) -> bool:
+        if not argv_tokens:
+            return False
+        for token in argv_tokens:
+            for flag in flag_names:
+                if token == flag or token.startswith(f"{flag}="):
+                    return True
+        return False
+    
+    def prompt_depth_value(default_value: float) -> float:
+        while True:
+            prompt = (
+                f"How deep do you want to go from the current price (%) "
+                f"[default {default_value:.2f}%]: "
+            )
+            entry = input(prompt).strip()
+            if not entry:
+                depth_val = default_value
+                print(f"Using ladder depth: {depth_val:.2f}%")
+                return depth_val
+            try:
+                depth_val = float(entry)
+            except ValueError:
+                print("Please enter a valid number.")
+                continue
+            if depth_val <= 0 or depth_val >= 100:
+                print("Depth must be greater than 0% and less than 100%.")
+                continue
+            return depth_val
+    
+    def prompt_profit_target_value(default_value: float) -> float:
+        while True:
+            entry = input(
+                f"Enter profit target percentage [default {default_value:.2f}%]: "
+            ).strip()
+            if not entry:
+                profit_val = default_value
+                print(f"Using profit target: {profit_val:.2f}%")
+                return profit_val
+            try:
+                profit_val = float(entry)
+            except ValueError:
+                print("Please enter a valid number.")
+                continue
+            if profit_val < 10 or profit_val > 200:
+                print("Profit target must be between 10% and 200%.")
+                continue
+            return profit_val
+    
+    def prompt_ladder_shape(default_key: str) -> str:
+        shape_keys = list(LADDER_SHAPE_PROFILES.keys())
+        print("\nLadder shape options:")
+        for idx, key in enumerate(shape_keys, start=1):
+            profile = LADDER_SHAPE_PROFILES[key]
+            print(f"  {idx}. {profile.label} ({key}) - {profile.description}")
+        default_index = shape_keys.index(default_key) + 1 if default_key in shape_keys else 1
+        while True:
+            selection = input(
+                f"Select ladder shape [default {default_index}]: "
+            ).strip().lower()
+            if not selection:
+                chosen_key = default_key
+            elif selection.isdigit():
+                option_idx = int(selection)
+                if 1 <= option_idx <= len(shape_keys):
+                    chosen_key = shape_keys[option_idx - 1]
+                else:
+                    print("Please choose a valid option number.")
+                    continue
+            else:
+                try:
+                    chosen_key = normalize_ladder_shape_key(selection)
+                except ValueError:
+                    print("Invalid shape. Please choose one of the listed options by number or name.")
+                    continue
+            profile = LADDER_SHAPE_PROFILES[chosen_key]
+            print(f"Selected ladder shape: {profile.label} - {profile.description}")
+            return chosen_key
+    
     # Get budget (required)
     if args and args.budget:
         budget = args.budget
@@ -1140,6 +1385,29 @@ def get_smart_input(args: Optional[argparse.Namespace] = None) -> Dict:
                 break
             except ValueError:
                 print("Please enter a valid number.")
+    
+    # Get ladder depth before other market inputs
+    default_depth = args.price_range if (args and args.price_range is not None) else 30.0
+    if args and argument_was_provided(('--price-range',)):
+        buy_price_range_pct = float(args.price_range)
+        print(f"Ladder depth: {buy_price_range_pct:.2f}%")
+    else:
+        buy_price_range_pct = prompt_depth_value(default_depth)
+    
+    if buy_price_range_pct <= 0 or buy_price_range_pct >= 100:
+        raise ValueError("Buy price range percentage must be greater than 0 and less than 100.")
+    
+    # Ask user for ladder shape preference with descriptors
+    default_shape_key = "deep-dive"
+    if args and getattr(args, "ladder_shape", None):
+        try:
+            ladder_shape_key = normalize_ladder_shape_key(args.ladder_shape)
+        except ValueError as exc:
+            raise ValueError(str(exc))
+        profile = LADDER_SHAPE_PROFILES[ladder_shape_key]
+        print(f"Ladder shape: {profile.label} - {profile.description}")
+    else:
+        ladder_shape_key = prompt_ladder_shape(default_shape_key)
     
     # Get current price (required for profit target method)
     if args and args.price:
@@ -1160,36 +1428,32 @@ def get_smart_input(args: Optional[argparse.Namespace] = None) -> Dict:
             except ValueError:
                 print("Please enter a valid number.")
     
-    # Get profit target (with default 75%)
-    if args and args.profit_target:
-        profit_target = args.profit_target
-        print(f"Profit Target: {profit_target}%")
+    # Get profit target with confirmation support
+    default_profit_target = args.profit_target if (args and args.profit_target is not None) else 75.0
+    if args and argument_was_provided(('--profit-target',)):
+        profit_target = float(args.profit_target)
+        print(f"Profit Target: {profit_target:.2f}%")
     else:
-        while True:
-            try:
-                profit_str = input("Enter profit target percentage (default 75%): ").strip()
-                if not profit_str:
-                    profit_target = 75.0
-                    print(f"Using default profit target: {profit_target}%")
-                    break
-                profit_target = float(profit_str)
-                if profit_target < 10 or profit_target > 200:
-                    print("Profit target must be between 10% and 200%.")
-                    continue
-                break
-            except ValueError:
-                print("Please enter a valid number.")
+        profit_target = prompt_profit_target_value(default_profit_target)
+    
+    if profit_target < 10 or profit_target > 200:
+        raise ValueError("Profit target must be between 10% and 200%.")
     
     # Get number of orders (with default 10)
-    if args and args.num_rungs:
-        num_rungs = args.num_rungs
+    default_num_rungs = args.num_rungs if (args and args.num_rungs is not None) else 10
+    if args and argument_was_provided(('--num-rungs',)):
+        num_rungs = int(args.num_rungs)
+        if num_rungs < 1:
+            raise ValueError("Number of orders must be at least 1.")
         print(f"Number of Orders: {num_rungs}")
     else:
         while True:
             try:
-                orders_str = input("Enter number of orders to place (default 10): ").strip()
+                orders_str = input(
+                    f"Enter number of orders to place (default {default_num_rungs}): "
+                ).strip()
                 if not orders_str:
-                    num_rungs = 10
+                    num_rungs = default_num_rungs
                     print(f"Using default number of orders: {num_rungs}")
                     break
                 num_rungs = int(orders_str)
@@ -1200,24 +1464,48 @@ def get_smart_input(args: Optional[argparse.Namespace] = None) -> Dict:
             except ValueError:
                 print("Please enter a valid integer.")
     
-    # Smart defaults for other parameters
-    buy_price_range_pct = args.price_range if (args and args.price_range) else 30.0
-    
-    print(f"\nConfiguration:")
-    print(f"  Number of orders: {num_rungs}")
-    print(f"  Profit target: {profit_target}%")
-    print(f"  Allocation strategy: exponential (buy more at lower prices, sell more at higher prices)")
-    print(f"  Buy price range: {buy_price_range_pct}%")
-    print(f"  Profit mode: overall")
-    
-    # Create calculator
     calculator = StaggeredLadderCalculator(budget, num_rungs)
+    can_prompt_user = hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+    results: Dict = {}
     
-    # Use profit target method with exponential allocation and overall profit mode
-    # Use current_price as the upper buy price (buy_upper)
-    results = calculator.calculate_from_profit_target(
-        current_price, profit_target, buy_price_range_pct
-    )
+    def print_configuration():
+        profile = LADDER_SHAPE_PROFILES[ladder_shape_key]
+        print("\nConfiguration:")
+        print(f"  Total budget: ${budget:,.2f}")
+        print(f"  Number of orders: {num_rungs}")
+        print(f"  Profit target: {profit_target:.2f}%")
+        print(f"  Ladder depth: {buy_price_range_pct:.2f}% below current price")
+        print(f"  Ladder shape: {profile.label} - {profile.description}")
+        print(f"  Profit mode: overall")
+    
+    while True:
+        print_configuration()
+        results = calculator.calculate_from_profit_target(
+            current_price,
+            profit_target,
+            buy_price_range_pct,
+            ladder_shape_key=ladder_shape_key
+        )
+        
+        bottom_buy_price = results['bottom_buy_price']
+        top_sell_price = results['top_sell_price']
+        
+        print("\nLadder depth confirmation:")
+        print(f"  Bottom buy price: ${bottom_buy_price:,.2f}")
+        print(f"  Top sell price:   ${top_sell_price:,.2f}")
+        
+        if not can_prompt_user:
+            break
+        
+        confirmation = input("Confirm these ladder bounds? [Y/n]: ").strip().lower()
+        if confirmation in ("", "y", "yes"):
+            break
+        
+        print("\nLet's adjust the ladder depth.")
+        buy_price_range_pct = prompt_depth_value(buy_price_range_pct)
+        adjust_profit = input("Adjust profit target as well? [y/N]: ").strip().lower()
+        if adjust_profit in ("y", "yes"):
+            profit_target = prompt_profit_target_value(profit_target)
     
     return results
 
@@ -1225,7 +1513,7 @@ def get_smart_input(args: Optional[argparse.Namespace] = None) -> Dict:
 def main():
     """Main function with command-line argument support."""
     parser = argparse.ArgumentParser(
-        description='Staggered Order Ladder Calculator - Uses exponential allocation and overall profit mode',
+        description='Staggered Order Ladder Calculator - Configurable ladder shapes with overall profit mode',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1238,8 +1526,8 @@ Examples:
 Defaults:
   - Profit target: 75%
   - Number of orders: 10
-  - Allocation: exponential (buy more at lower prices, sell more at higher prices)
-  - Buy price range: 30%
+  - Ladder depth: 30% below current price
+  - Ladder shape: Deep Dive (heavier lower buys, heavier higher sells)
   - Profit mode: overall
         """
     )
@@ -1270,7 +1558,12 @@ Defaults:
         '--price-range',
         type=float,
         default=30.0,
-        help='Buy price range percentage (default: 30%%)'
+        help='Ladder depth percentage below current price (default: 30%%)'
+    )
+    parser.add_argument(
+        '--ladder-shape',
+        type=str,
+        help='Ladder shape profile (options: balanced, deep-dive, springboard, glide-path)'
     )
     parser.add_argument(
         '--output-prefix',
@@ -1307,7 +1600,14 @@ Defaults:
         total_buy_volume = sum(results['buy_quantities'])
         total_sell_volume = sum(results['sell_quantities'])
         
+        ladder_depth_pct = compute_ladder_depth_pct(list(results.get('buy_prices', [])))
+        ladder_shape_summary = summarize_ladder_shape(results)
+        
         print(f"\nSummary:")
+        print(f"  Ladder Shape: {ladder_shape_summary}")
+        print(f"  Ladder Depth: {ladder_depth_pct:.2f}%")
+        print(f"  Bottom Buy Price: ${results['bottom_buy_price']:,.2f}")
+        print(f"  Top Sell Price: ${results['top_sell_price']:,.2f}")
         print(f"  Total Cost: ${results['total_cost']:,.2f}")
         print(f"  Total Revenue: ${results['total_revenue']:,.2f}")
         print(f"  Total Profit: ${results['total_profit']:,.2f}")
